@@ -37,6 +37,9 @@
 * **More friendly**. LION can train all models on less 24G GPU memory (i.e., RTX 3090, RTX4090, V100 and A100 are enough to train our LION). 😀
 
 ## News
+* **2025.12.15**: [DrivePI](http://arxiv.org/abs/2512.12799) paper released. 🔥
+* **2025.12.15**: [GenieDrive](https://github.com/Huster-YZY/GenieDrive) (Physics-Aware Driving World Model) paper released. 🔥
+* **2025.11.04**: Our previous work [UniLION](https://github.com/happinesslz/UniLION) has been released. Check out the [codebase](https://github.com/happinesslz/UniLION) for unified autonomous driving model with Linear Group RNNs. 🚀
 * **2025.06.16**: Our new work about Transformer-Mamba architecture [HybridTM](https://github.com/deepinact/HybridTM) have been accepted by IROS 2025 as **Oral** presentation. 🎉
 * **2024.09.26**: LION has been accepted by NeurIPS 2024. 🎉
 * **2024.07.25**: LION paper released. 🔥
