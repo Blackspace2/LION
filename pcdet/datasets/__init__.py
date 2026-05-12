@@ -11,7 +11,11 @@ from .nuscenes.nuscenes_dataset import NuScenesDataset
 from .waymo.waymo_dataset import WaymoDataset
 from .pandaset.pandaset_dataset import PandasetDataset
 from .lyft.lyft_dataset import LyftDataset
-from .argo2.argo2_dataset import Argo2Dataset
+try:
+    from .argo2.argo2_dataset import Argo2Dataset
+except Exception:
+    Argo2Dataset = None
+    print('Warning: Argo2Dataset is not available.')
 from .once.once_dataset import ONCEDataset
 from .custom.custom_dataset import CustomDataset
 
@@ -23,9 +27,10 @@ __all__ = {
     'PandasetDataset': PandasetDataset,
     'LyftDataset': LyftDataset,
     'CustomDataset': CustomDataset,
-    'Argo2Dataset': Argo2Dataset,
     'ONCEDataset': ONCEDataset,
 }
+if Argo2Dataset is not None:
+    __all__['Argo2Dataset'] = Argo2Dataset
 
 
 class DistributedSampler(_DistributedSampler):
