@@ -87,45 +87,45 @@ class FlattenedWindowMapping(nn.Module):
 
     def forward(self, coords: torch.Tensor, batch_size: int, sparse_shape: list):
         coords = coords.long()
-        _, num_per_batch = torch.unique(coords[:, 0], sorted=False, return_counts=True)
-        batch_start_indices = F.pad(torch.cumsum(num_per_batch, dim=0), (1, 0))
-        num_per_batch_p = (
-                torch.div(
-                    batch_start_indices[1:] - batch_start_indices[:-1] + self.group_size - 1,
-                    self.group_size,
-                    rounding_mode="trunc",
-                )
-                * self.group_size
+        actual_batch_size = max(batch_size, int(coords[:, 0].max().item()) + 1) if coords.numel() > 0 else batch_size
+        num_per_batch = torch.bincount(coords[:, 0], minlength=actual_batch_size)
+        flat2win_list = []
+        win2flat = torch.zeros(coords.shape[0], dtype=torch.long, device=coords.device)
+        flat_start = 0
+        padded_start = 0
+
+        for i in range(actual_batch_size):
+            cur_num = int(num_per_batch[i].item())
+            if cur_num == 0:
+                continue
+
+            cur_flat = torch.arange(cur_num, dtype=torch.long, device=coords.device)
+            padded_num = int(math.ceil(cur_num / self.group_size) * self.group_size)
+            pad_num = padded_num - cur_num
+
+            if pad_num > 0:
+                repeat_times = int(math.ceil(pad_num / cur_num))
+                cur_flat_padded = torch.cat([cur_flat, cur_flat.repeat(repeat_times)[:pad_num]], dim=0)
+            else:
+                cur_flat_padded = cur_flat
+
+            flat2win_list.append(cur_flat_padded + flat_start)
+            win2flat[flat_start: flat_start + cur_num] = torch.arange(
+                cur_num, dtype=torch.long, device=coords.device
+            ) + padded_start
+
+            flat_start += cur_num
+            padded_start += padded_num
+
+        if flat_start != coords.shape[0]:
+            raise RuntimeError(
+                f'FlattenedWindowMapping covered {flat_start} coords, but received {coords.shape[0]}. '
+                f'batch_size={batch_size}, actual_batch_size={actual_batch_size}'
+            )
+
+        flat2win = torch.cat(flat2win_list, dim=0) if flat2win_list else torch.empty(
+            0, dtype=torch.long, device=coords.device
         )
-
-        batch_start_indices_p = F.pad(torch.cumsum(num_per_batch_p, dim=0), (1, 0))
-        flat2win = torch.arange(batch_start_indices_p[-1], device=coords.device)  # .to(coords.device)
-        win2flat = torch.arange(batch_start_indices[-1], device=coords.device)  # .to(coords.device)
-
-        for i in range(batch_size):
-            if num_per_batch[i] != num_per_batch_p[i]:
-                
-                bias_index = batch_start_indices_p[i] - batch_start_indices[i]
-                flat2win[
-                    batch_start_indices_p[i + 1] - self.group_size + (num_per_batch[i] % self.group_size):
-                    batch_start_indices_p[i + 1]
-                    ] = flat2win[
-                        batch_start_indices_p[i + 1]
-                        - 2 * self.group_size
-                        + (num_per_batch[i] % self.group_size): batch_start_indices_p[i + 1] - self.group_size
-                        ] if (batch_start_indices_p[i + 1] - batch_start_indices_p[i]) - self.group_size != 0 else \
-                        win2flat[batch_start_indices[i]: batch_start_indices[i + 1]].repeat(
-                            (batch_start_indices_p[i + 1] - batch_start_indices_p[i]) // num_per_batch[i] + 1)[
-                        : self.group_size - (num_per_batch[i] % self.group_size)] + bias_index
-
-
-            win2flat[batch_start_indices[i]: batch_start_indices[i + 1]] += (
-                    batch_start_indices_p[i] - batch_start_indices[i]
-            )
-
-            flat2win[batch_start_indices_p[i]: batch_start_indices_p[i + 1]] -= (
-                    batch_start_indices_p[i] - batch_start_indices[i]
-            )
 
         mappings = {"flat2win": flat2win, "win2flat": win2flat}
 
@@ -278,17 +278,16 @@ class PatchMerging3D(nn.Module):
         coords[:, 2:3] = coords[:, 2:3] // down_scale[1]
         coords[:, 1:2] = coords[:, 1:2] // down_scale[2]
 
-        scale_xyz = (x.spatial_shape[0] // down_scale[2]) * (x.spatial_shape[1] // down_scale[1]) * (
-                x.spatial_shape[2] // down_scale[0])
-        scale_yz = (x.spatial_shape[0] // down_scale[2]) * (x.spatial_shape[1] // down_scale[1])
-        scale_z = (x.spatial_shape[0] // down_scale[2])
+        new_sparse_shape = [math.ceil(x.spatial_shape[i] / down_scale[2 - i]) for i in range(3)]
+        scale_xyz = new_sparse_shape[0] * new_sparse_shape[1] * new_sparse_shape[2]
+        scale_yz = new_sparse_shape[0] * new_sparse_shape[1]
+        scale_z = new_sparse_shape[0]
 
 
         merge_coords = coords[:, 0].int() * scale_xyz + coords[:, 3] * scale_yz + coords[:, 2] * scale_z + coords[:, 1]
 
         features_expand = final_diffusion_feats
 
-        new_sparse_shape = [math.ceil(x.spatial_shape[i] / down_scale[2 - i]) for i in range(3)]
         unq_coords, unq_inv = torch.unique(merge_coords, return_inverse=True, return_counts=False, dim=0)
 
         x_merge = torch_scatter.scatter_add(features_expand, unq_inv, dim=0)
@@ -299,6 +298,15 @@ class PatchMerging3D(nn.Module):
                                     (unq_coords % scale_yz) // scale_z,
                                     unq_coords % scale_z), dim=1)
         voxel_coords = voxel_coords[:, [0, 3, 2, 1]]
+        if voxel_coords.numel() > 0:
+            max_zyx = voxel_coords[:, 1:].max(dim=0).values
+            min_zyx = voxel_coords[:, 1:].min(dim=0).values
+            shape = torch.tensor(new_sparse_shape, device=voxel_coords.device, dtype=voxel_coords.dtype)
+            if (min_zyx < 0).any() or (max_zyx >= shape).any():
+                raise RuntimeError(
+                    f'PatchMerging3D produced out-of-range coords: '
+                    f'min_zyx={min_zyx.tolist()}, max_zyx={max_zyx.tolist()}, shape={new_sparse_shape}'
+                )
 
         x_merge = self.norm(x_merge)
 
@@ -368,7 +376,8 @@ class LIONLayer(nn.Module):
 
             x_features = block(x_features)
 
-            x.features[indices] = x_features.view(-1, x_features.shape[-1])[mappings["win2flat"]]
+            x_features = x_features.view(-1, x_features.shape[-1])[mappings["win2flat"]]
+            x.features[indices] = x_features.to(dtype=x.features.dtype)
 
         return x
 
@@ -453,28 +462,32 @@ class LIONBlock(nn.Module):
 
         embed_layer = embed_layer
         if len(window_shape) == 2:
-            ndim = 2
             win_x, win_y = window_shape
-            win_z = 0
+            win_z = 1
+            use_degenerate_z = True
         elif window_shape[-1] == 1:
-            ndim = 2
             win_x, win_y = window_shape[:2]
-            win_z = 0
+            win_z = 1
+            use_degenerate_z = True
         else:
             win_x, win_y, win_z = window_shape
-            ndim = 3
+            use_degenerate_z = False
 
-        z, y, x = coors[:, 0] - win_z / 2, coors[:, 1] - win_y / 2, coors[:, 2] - win_x / 2
+        z = coors[:, 0] - win_z / 2
+        y = coors[:, 1] - win_y / 2
+        x = coors[:, 2] - win_x / 2
 
         if normalize_pos:
             x = x / win_x * 2 * 3.1415  # [-pi, pi]
             y = y / win_y * 2 * 3.1415  # [-pi, pi]
-            z = z / win_z * 2 * 3.1415  # [-pi, pi]
+            if use_degenerate_z:
+                z = torch.zeros_like(x)
+            else:
+                z = z / win_z * 2 * 3.1415  # [-pi, pi]
+        elif use_degenerate_z:
+            z = torch.zeros_like(x)
 
-        if ndim == 2:
-            location = torch.stack((x, y), dim=-1)
-        else:
-            location = torch.stack((x, y, z), dim=-1)
+        location = torch.stack((x, y, z), dim=-1)
         pos_embed = embed_layer(location)
 
         return pos_embed
