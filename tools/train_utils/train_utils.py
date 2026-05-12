@@ -17,6 +17,23 @@ except:
 
 
 
+def _snapshot_bn_running_buffers(model):
+    module = model.module if hasattr(model, 'module') else model
+    return {
+        name: buf.detach().clone()
+        for name, buf in module.named_buffers()
+        if 'running_mean' in name or 'running_var' in name or 'num_batches_tracked' in name
+    }
+
+
+def _restore_bn_running_buffers(model, snapshot):
+    module = model.module if hasattr(model, 'module') else model
+    buffers = dict(module.named_buffers())
+    for name, saved in snapshot.items():
+        if name in buffers:
+            buffers[name].copy_(saved)
+
+
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False,
                     use_logger_to_record=False, logger=None, logger_iter_interval=50, cur_epoch=None,
@@ -42,11 +59,13 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
 
     amp_ctx = contextlib.nullcontext()
     if fp16:
-        scaler = torch.cuda.amp.grad_scaler.GradScaler(init_scale=optim_cfg.get('LOSS_SCALE_FP16', 2.0**16))
+        scaler = torch.cuda.amp.grad_scaler.GradScaler(init_scale=optim_cfg.get('LOSS_SCALE_FP16', 2.0**12))
         amp_ctx = torch.cuda.amp.autocast()
 
 
     end = time.time()
+    consecutive_nonfinite_skips = 0
+    max_consecutive_nonfinite_skips = int(os.environ.get('LION_MAX_CONSECUTIVE_NONFINITE_SKIP', '20'))
     for cur_it in range(start_it, total_it_each_epoch):
         try:
             batch = next(dataloader_iter)
@@ -71,23 +90,86 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         model.train()
         optimizer.zero_grad()
 
+        skipped_nonfinite = False
+        total_norm = torch.zeros((), device='cuda' if torch.cuda.is_available() else 'cpu')
+        bn_running_snapshot = _snapshot_bn_running_buffers(model)
         with amp_ctx:
-            loss, tb_dict, disp_dict = model_func(model, batch)
-            if fp16:
+            try:
+                loss, tb_dict, disp_dict = model_func(model, batch)
+            except torch.cuda.OutOfMemoryError as e:
+                skipped_nonfinite = True
+                _restore_bn_running_buffers(model, bn_running_snapshot)
+                optimizer.zero_grad()
+                loss = torch.zeros((), device='cuda' if torch.cuda.is_available() else 'cpu')
+                tb_dict = {}
+                disp_dict = {}
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if rank == 0 and logger is not None:
+                    logger.warning(
+                        f'Skip CUDA OOM batch at epoch={cur_epoch}, iter={cur_it}, '
+                        f'acc_iter={accumulated_iter}: {e}'
+                    )
+            if skipped_nonfinite:
+                pass
+            elif not torch.isfinite(loss).all():
+                skipped_nonfinite = True
+                _restore_bn_running_buffers(model, bn_running_snapshot)
+                if rank == 0 and logger is not None:
+                    logger.warning(
+                        f'Skip non-finite loss at epoch={cur_epoch}, iter={cur_it}, '
+                        f'acc_iter={accumulated_iter}, loss={loss.item()}'
+                    )
+                optimizer.zero_grad()
+                loss = loss.detach()
+                tb_dict = {}
+                disp_dict = {}
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            elif fp16:
                 assert loss.dtype is torch.float32
                 scaler.scale(loss).backward()
                 # unscale gradient for clip gradient
                 scaler.unscale_(optimizer)
                 total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
-                scaler.step(optimizer)
-                scaler.update()
+                if torch.isfinite(total_norm):
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    skipped_nonfinite = True
+                    optimizer.zero_grad()
+                    scaler.update()
+                    if rank == 0 and logger is not None:
+                        logger.warning(
+                            f'Skip non-finite grad norm at epoch={cur_epoch}, iter={cur_it}, '
+                            f'acc_iter={accumulated_iter}, norm={total_norm.item()}'
+                        )
             else:
                 loss.backward()
                 total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
-                optimizer.step()
+                if torch.isfinite(total_norm):
+                    optimizer.step()
+                else:
+                    skipped_nonfinite = True
+                    optimizer.zero_grad()
+                    if rank == 0 and logger is not None:
+                        logger.warning(
+                            f'Skip non-finite grad norm at epoch={cur_epoch}, iter={cur_it}, '
+                            f'acc_iter={accumulated_iter}, norm={total_norm.item()}'
+                        )
 
         accumulated_iter += 1
         # assert not torch.isnan(loss)
+        if skipped_nonfinite:
+            consecutive_nonfinite_skips += 1
+            if consecutive_nonfinite_skips >= max_consecutive_nonfinite_skips:
+                raise RuntimeError(
+                    f'Abort training after {consecutive_nonfinite_skips} consecutive non-finite/OOM skips '
+                    f'at epoch={cur_epoch}, iter={cur_it}. Resume from an earlier clean checkpoint with a '
+                    f'lower LR, smaller batch size, or fp32.'
+                )
+        else:
+            consecutive_nonfinite_skips = 0
 
         cur_forward_time = time.time() - data_timer
         cur_batch_time = time.time() - end
@@ -103,7 +185,8 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             data_time.update(avg_data_time)
             forward_time.update(avg_forward_time)
             batch_time.update(avg_batch_time)
-            loss_disp.update(loss.item())
+            if not skipped_nonfinite:
+                loss_disp.update(loss.item())
             
             # for centerhead
             if 'hm_loss_head_0' in list(tb_dict.keys()) and 'loc_loss_head_0' in list(tb_dict.keys()):
@@ -117,9 +200,9 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 disp_dict.update({
                 'loss_rcnn_cls': f'{rcnn_cls_loss_disp.avg:.4f}', 'loss_rcnn_reg': f'{rcnn_reg_loss_disp.avg:.4f}'})
             disp_dict.update({
-                'loss': loss_disp.avg, 'lr': cur_lr, 'd_time': f'{data_time.val:.2f}({data_time.avg:.2f})',
+                'loss': loss_disp.avg if loss_disp.count > 0 else loss.item(), 'lr': cur_lr, 'd_time': f'{data_time.val:.2f}({data_time.avg:.2f})',
                 'f_time': f'{forward_time.val:.2f}({forward_time.avg:.2f})', 'b_time': f'{batch_time.val:.2f}({batch_time.avg:.2f})',
-                'norm': total_norm.item()
+                'norm': total_norm.item(), 'skipped_nonfinite': int(skipped_nonfinite)
             })
 
             if use_logger_to_record:
@@ -155,10 +238,14 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 # tbar.refresh()
 
             if tb_log is not None:
-                tb_log.add_scalar('train/loss', loss, accumulated_iter)
+                if not skipped_nonfinite:
+                    tb_log.add_scalar('train/loss', loss, accumulated_iter)
+                tb_log.add_scalar('train/grad_norm', total_norm.item(), accumulated_iter)
+                tb_log.add_scalar('train/nonfinite_skip', int(skipped_nonfinite), accumulated_iter)
                 tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
-                for key, val in tb_dict.items():
-                    tb_log.add_scalar('train/' + key, val, accumulated_iter)
+                if not skipped_nonfinite:
+                    for key, val in tb_dict.items():
+                        tb_log.add_scalar('train/' + key, val, accumulated_iter)
 
             # save intermediate ckpt every {ckpt_save_time_interval} seconds
             time_past_this_epoch = pbar.format_dict['elapsed']
