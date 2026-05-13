@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(pip list *)",
+      "Bash(python3 *)",
+      "Bash(pip install *)",
+      "Bash(conda install */)",
+      "Bash(nvidia-smi)",
+      "Read(//root/autodl-tmp/kitti-offical/**)"
+    ]
+  }
+}
