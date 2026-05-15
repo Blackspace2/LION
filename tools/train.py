@@ -24,6 +24,7 @@ def parse_config():
 
     parser.add_argument('--batch_size', type=int, default=None, required=False, help='batch size for training')
     parser.add_argument('--epochs', type=int, default=None, required=False, help='number of epochs to train for')
+    parser.add_argument('--total_epochs', type=int, default=None, required=False, help='total number of epochs for scheduler / overall training horizon')
     parser.add_argument('--workers', type=int, default=4, help='number of workers for dataloader')
     parser.add_argument('--extra_tag', type=str, default='default', help='extra tag for this experiment')
     parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to start from')
@@ -84,6 +85,8 @@ def main():
         args.batch_size = args.batch_size // total_gpus
 
     args.epochs = cfg.OPTIMIZATION.NUM_EPOCHS if args.epochs is None else args.epochs
+    args.total_epochs = args.epochs if args.total_epochs is None else args.total_epochs
+    assert args.total_epochs >= args.epochs, 'total_epochs should be >= epochs'
 
     if args.fix_random_seed:
         common_utils.set_random_seed(666 + cfg.LOCAL_RANK)
@@ -121,7 +124,7 @@ def main():
         logger=logger,
         training=True,
         merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
-        total_epochs=args.epochs,
+        total_epochs=args.total_epochs,
         seed=666 if args.fix_random_seed else None
     )
 
@@ -164,7 +167,7 @@ def main():
     logger.info(f'Total number of parameters: {num_total_params}')
     
     lr_scheduler, lr_warmup_scheduler = build_scheduler(
-        optimizer, total_iters_each_epoch=len(train_loader), total_epochs=args.epochs,
+        optimizer, total_iters_each_epoch=len(train_loader), total_epochs=args.total_epochs,
         last_epoch=last_epoch, optim_cfg=cfg.OPTIMIZATION
     )
 
@@ -180,7 +183,8 @@ def main():
         lr_scheduler=lr_scheduler,
         optim_cfg=cfg.OPTIMIZATION,
         start_epoch=start_epoch,
-        total_epochs=args.epochs,
+        total_epochs=args.total_epochs,
+        stop_epoch=args.epochs,
         start_iter=it,
         rank=cfg.LOCAL_RANK,
         tb_log=tb_log,
