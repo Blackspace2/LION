@@ -173,7 +173,7 @@ def compute_best_values(rows: List[EpochMetrics], group_name: str) -> Dict[Tuple
     return best_values
 
 
-def draw_group_table(ax, group_name: str, rows: List[EpochMetrics]) -> None:
+def draw_group_table(ax, group_name: str, rows: List[EpochMetrics], recall_mode: str) -> None:
     ax.set_axis_off()
 
     col_widths = [1.25] + [1.0] * 9
@@ -199,7 +199,7 @@ def draw_group_table(ax, group_name: str, rows: List[EpochMetrics]) -> None:
     mid_rule_y = title_h + header1_h + header2_h
     bottom_rule_y = mid_rule_y + row_h * len(rows)
 
-    ax.text(0, title_y, group_name, ha="left", va="center", fontsize=16, fontweight="bold")
+    ax.text(total_width / 2, title_y, f"{recall_mode} {group_name}", ha="center", va="center", fontsize=16, fontweight="bold")
 
     ax.hlines(top_rule_y, x_edges[0], x_edges[-1], linewidth=1.6, color="black")
     ax.hlines(mid_rule_y, x_edges[0], x_edges[-1], linewidth=1.0, color="black")
@@ -218,7 +218,7 @@ def draw_group_table(ax, group_name: str, rows: List[EpochMetrics]) -> None:
     for start, end in [(1, 4), (4, 7), (7, 10)]:
         ax.hlines(cmidrule_y, x_edges[start] + 0.08, x_edges[end] - 0.08, linewidth=0.9, color="black")
 
-    subheaders = [""] + ["Easy", "Middle", "Hard"] * 3
+    subheaders = [""] + ["Easy", "Moderate", "Hard"] * 3
     for idx, label in enumerate(subheaders):
         x0, x1 = x_edges[idx], x_edges[idx + 1]
         ax.text((x0 + x1) / 2, header2_center_y, label, ha="center", va="center", fontsize=11)
@@ -258,7 +258,7 @@ def render_table_image(eval_dir: Path, rows: List[EpochMetrics], metric: str, re
     )
 
     for ax, group_name in zip(axes, THRESHOLD_GROUPS):
-        draw_group_table(ax, group_name, rows)
+        draw_group_table(ax, group_name, rows, recall_mode)
 
     output_path = output_dir / f"eval_summary_{metric}_{recall_mode}.png"
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight", facecolor="white")
