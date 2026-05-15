@@ -263,14 +263,14 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
 
 
 def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
-                start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
+                start_epoch, total_epochs, stop_epoch, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False,
                 use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, fp16=False, cfg=None):
     accumulated_iter = start_iter
 
     augment_disable_flag = False
-    with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
+    with tqdm.trange(start_epoch, stop_epoch, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
         total_it_each_epoch = len(train_loader)
         if merge_all_iters_to_one_epoch:
             assert hasattr(train_loader.dataset, 'merge_all_iters_to_one_epoch')
@@ -313,7 +313,7 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 lr_scheduler=cur_scheduler,
                 accumulated_iter=accumulated_iter, optim_cfg=optim_cfg,
                 rank=rank, tbar=tbar, tb_log=tb_log,
-                leave_pbar=(cur_epoch + 1 == total_epochs),
+                leave_pbar=(cur_epoch + 1 == stop_epoch),
                 total_it_each_epoch=total_it_each_epoch,
                 dataloader_iter=dataloader_iter,
 
