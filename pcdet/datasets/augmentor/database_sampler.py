@@ -9,6 +9,7 @@ import SharedArray
 import torch.distributed as dist
 
 from ...ops.iou3d_nms import iou3d_nms_utils
+from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 from ...utils import box_utils, common_utils, calibration_kitti
 from pcdet.datasets.kitti.kitti_object_eval_python import kitti_common
 
@@ -225,6 +226,8 @@ class DataBaseSampler(object):
         if 'annotation' in kitti_img_aug_use_type:
             data_dict['points'] = data_dict['points'][keep_mask]
             data_dict['points_2d'] = data_dict['points_2d'][keep_mask]
+            if data_dict.get('point_ground_labels', None) is not None:
+                data_dict['point_ground_labels'] = data_dict['point_ground_labels'][keep_mask]
         elif 'projection' in kitti_img_aug_use_type:
             overlap_mask[overlap_mask>=1] = 1
             data_dict['overlap_mask'] = overlap_mask
@@ -367,6 +370,7 @@ class DataBaseSampler(object):
         gt_boxes = data_dict['gt_boxes'][gt_boxes_mask]
         gt_names = data_dict['gt_names'][gt_boxes_mask]
         points = data_dict['points']
+        point_ground_labels = data_dict.get('point_ground_labels', None)
         if self.sampler_cfg.get('USE_ROAD_PLANE', False) and mv_height is None:
             sampled_gt_boxes, mv_height = self.put_boxes_on_road_planes(
                 sampled_gt_boxes, data_dict['road_plane'], data_dict['calib']
@@ -433,13 +437,31 @@ class DataBaseSampler(object):
         large_sampled_gt_boxes = box_utils.enlarge_box3d(
             sampled_gt_boxes[:, 0:7], extra_width=self.sampler_cfg.REMOVE_EXTRA_WIDTH
         )
-        points = box_utils.remove_points_in_boxes3d(points, large_sampled_gt_boxes)
+        if point_ground_labels is not None:
+            pts_tensor = points[:, 0:3] if isinstance(points, torch.Tensor) else torch.from_numpy(points[:, 0:3])
+            boxes_tensor = (
+                large_sampled_gt_boxes[:, 0:7]
+                if isinstance(large_sampled_gt_boxes, torch.Tensor)
+                else torch.from_numpy(large_sampled_gt_boxes[:, 0:7])
+            )
+            point_masks = roiaware_pool3d_utils.points_in_boxes_cpu(
+                pts_tensor, boxes_tensor
+            ).numpy()
+            keep_mask = point_masks.sum(axis=0) == 0
+            points = points[keep_mask]
+            point_ground_labels = point_ground_labels[keep_mask]
+        else:
+            points = box_utils.remove_points_in_boxes3d(points, large_sampled_gt_boxes)
+
         points = np.concatenate([obj_points[:, :points.shape[-1]], points], axis=0)
         gt_names = np.concatenate([gt_names, sampled_gt_names], axis=0)
         gt_boxes = np.concatenate([gt_boxes, sampled_gt_boxes], axis=0)
         data_dict['gt_boxes'] = gt_boxes
         data_dict['gt_names'] = gt_names
         data_dict['points'] = points
+        if point_ground_labels is not None:
+            sampled_point_ground_labels = np.zeros(obj_points.shape[0], dtype=point_ground_labels.dtype)
+            data_dict['point_ground_labels'] = np.concatenate([sampled_point_ground_labels, point_ground_labels], axis=0)
 
         if self.img_aug_type is not None:
             data_dict = self.copy_paste_to_image(img_aug_gt_dict, data_dict, points)
