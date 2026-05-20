@@ -37,6 +37,7 @@ class Detector3DTemplate(nn.Module):
             'module_list': [],
             'num_rawpoint_features': self.dataset.point_feature_encoder.num_point_features,
             'num_point_features': self.dataset.point_feature_encoder.num_point_features,
+            'point_feature_names': list(self.dataset.point_feature_encoder.used_feature_list),
             'grid_size': self.dataset.grid_size,
             'point_cloud_range': self.dataset.point_cloud_range,
             'voxel_size': self.dataset.voxel_size,
@@ -56,6 +57,7 @@ class Detector3DTemplate(nn.Module):
         vfe_module = vfe.__all__[self.model_cfg.VFE.NAME](
             model_cfg=self.model_cfg.VFE,
             num_point_features=model_info_dict['num_rawpoint_features'],
+            point_feature_names=model_info_dict.get('point_feature_names', None),
             point_cloud_range=model_info_dict['point_cloud_range'],
             voxel_size=model_info_dict['voxel_size'],
             grid_size=model_info_dict['grid_size'],
@@ -72,6 +74,7 @@ class Detector3DTemplate(nn.Module):
         backbone_3d_module = backbones_3d.__all__[self.model_cfg.BACKBONE_3D.NAME](
             model_cfg=self.model_cfg.BACKBONE_3D,
             input_channels=model_info_dict['num_point_features'],
+            point_feature_names=model_info_dict.get('point_feature_names', None),
             grid_size=model_info_dict['grid_size'],
             voxel_size=model_info_dict['voxel_size'],
             point_cloud_range=model_info_dict['point_cloud_range'],
@@ -347,6 +350,19 @@ class Detector3DTemplate(nn.Module):
 
         update_model_state = {}
         for key, val in model_state_disk.items():
+            if key in state_dict:
+                target_val = state_dict[key]
+                if (
+                    key.endswith('vfe.pfn_layers.0.linear.weight') and
+                    target_val.ndim == 2 and
+                    val.ndim == 2 and
+                    target_val.shape[0] == val.shape[0] and
+                    target_val.shape[1] > val.shape[1]
+                ):
+                    adapted_val = target_val.new_zeros(target_val.shape)
+                    adapted_val[:, :val.shape[1]] = val
+                    val = adapted_val
+
             if key in spconv_keys and key in state_dict and state_dict[key].shape != val.shape:
                 # with different spconv versions, we need to adapt weight shapes for spconv blocks
                 # adapt spconv weights from version 1.x to version 2.x if you used weights from spconv 1.x
@@ -426,4 +442,3 @@ class Detector3DTemplate(nn.Module):
         logger.info('==> Done')
 
         return it, epoch
-
