@@ -40,6 +40,20 @@ class DataAugmentor(object):
     def __setstate__(self, d):
         self.__dict__.update(d)
 
+    @staticmethod
+    def _apply_ground_feature_aware_scaling(data_dict, noise_scale):
+        ground_feature_indices = data_dict.get('ground_point_feature_indices', None)
+        if ground_feature_indices is None:
+            return
+
+        points = data_dict['points']
+        for feature_name in ('delta_z_to_ground', 'local_ground_height'):
+            feature_idx = ground_feature_indices.get(feature_name, None)
+            if feature_idx is None:
+                continue
+            points[:, feature_idx] *= noise_scale
+        data_dict['points'] = points
+
     def random_world_flip(self, data_dict=None, config=None):
         if data_dict is None:
             return partial(self.random_world_flip, config=config)
@@ -98,6 +112,7 @@ class DataAugmentor(object):
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
         data_dict['noise_scale'] = noise_scale
+        self._apply_ground_feature_aware_scaling(data_dict, noise_scale)
         return data_dict
 
     def random_image_flip(self, data_dict=None, config=None):
