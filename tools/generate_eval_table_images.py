@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
 
 def find_eval_files(eval_dir: Path, eval_tag: Optional[str]) -> Dict[int, Path]:
     files_by_epoch: Dict[int, List[Path]] = {}
-    for path in eval_dir.rglob("official_eval_py310.txt"):
+    for path in eval_dir.rglob("official_eval*.txt"):
         match = re.search(r"epoch_(\d+)", str(path))
         if not match:
             continue
@@ -155,7 +155,7 @@ def parse_eval_file(path: Path, metric_name: str, recall_mode: str) -> EpochMetr
 def collect_rows(eval_dir: Path, metric: str, eval_tag: Optional[str], recall_mode: str) -> List[EpochMetrics]:
     files_by_epoch = find_eval_files(eval_dir, eval_tag)
     if not files_by_epoch:
-        raise SystemExit(f"No official_eval_py310.txt found under: {eval_dir}")
+        raise SystemExit(f"No official_eval*.txt found under: {eval_dir}")
     return [parse_eval_file(path, metric, recall_mode) for _, path in sorted(files_by_epoch.items())]
 
 
@@ -173,10 +173,27 @@ def compute_best_values(rows: List[EpochMetrics], group_name: str) -> Dict[Tuple
     return best_values
 
 
+def compute_row_map(row: EpochMetrics, group_name: str) -> str:
+    values: List[float] = []
+    for class_name in CLASS_ORDER:
+        class_metrics = row.values.get(group_name, {}).get(class_name, ["", "", ""])
+        for raw in class_metrics:
+            if raw != "":
+                values.append(float(raw))
+    if not values:
+        return ""
+    return f"{sum(values) / len(values):.4f}"
+
+
+def compute_best_map(rows: List[EpochMetrics], group_name: str) -> Optional[float]:
+    values = [float(map_value) for row in rows if (map_value := compute_row_map(row, group_name)) != ""]
+    return max(values) if values else None
+
+
 def draw_group_table(ax, group_name: str, rows: List[EpochMetrics], recall_mode: str) -> None:
     ax.set_axis_off()
 
-    col_widths = [1.25] + [1.0] * 9
+    col_widths = [1.25] + [1.0] * 9 + [1.1]
     x_edges = [0.0]
     for w in col_widths:
         x_edges.append(x_edges[-1] + w)
@@ -210,6 +227,7 @@ def draw_group_table(ax, group_name: str, rows: List[EpochMetrics], recall_mode:
         "Car": (1, 4),
         "Pedestrain": (4, 7),
         "Cyclist": (7, 10),
+        "mAP": (10, 11),
     }
     for label, (start, end) in group_spans.items():
         x0, x1 = x_edges[start], x_edges[end]
@@ -218,12 +236,13 @@ def draw_group_table(ax, group_name: str, rows: List[EpochMetrics], recall_mode:
     for start, end in [(1, 4), (4, 7), (7, 10)]:
         ax.hlines(cmidrule_y, x_edges[start] + 0.08, x_edges[end] - 0.08, linewidth=0.9, color="black")
 
-    subheaders = [""] + ["Easy", "Moderate", "Hard"] * 3
+    subheaders = [""] + ["Easy", "Moderate", "Hard"] * 3 + [""]
     for idx, label in enumerate(subheaders):
         x0, x1 = x_edges[idx], x_edges[idx + 1]
         ax.text((x0 + x1) / 2, header2_center_y, label, ha="center", va="center", fontsize=11)
 
     best_values = compute_best_values(rows, group_name)
+    best_map = compute_best_map(rows, group_name)
     start_y = mid_rule_y
 
     for row_idx, row in enumerate(rows):
@@ -246,6 +265,18 @@ def draw_group_table(ax, group_name: str, rows: List[EpochMetrics], recall_mode:
                     fontweight="bold" if is_best else "normal",
                 )
                 col_idx += 1
+
+        map_value = compute_row_map(row, group_name)
+        map_is_best = map_value != "" and best_map is not None and abs(float(map_value) - best_map) < 1e-9
+        ax.text(
+            (x_edges[col_idx] + x_edges[col_idx + 1]) / 2,
+            y,
+            map_value,
+            ha="center",
+            va="center",
+            fontsize=10.5,
+            fontweight="bold" if map_is_best else "normal",
+        )
 
 
 def render_table_image(eval_dir: Path, rows: List[EpochMetrics], metric: str, recall_mode: str, output_dir: Path, dpi: int) -> Path:
