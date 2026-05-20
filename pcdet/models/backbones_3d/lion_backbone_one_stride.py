@@ -12,6 +12,7 @@ from ..model_utils.retnet_attn import Block as RetNetBlock
 from ..model_utils.rwkv_cls import Block as RWKVBlock
 from ..model_utils.vision_lstm2 import xLSTM_Block
 from ..model_utils.ttt import TTTBlock
+from .ground_context_utils import pool_ground_context_to_sparse_coords
 from ...utils.spconv_utils import replace_feature, spconv
 import torch.utils.checkpoint as cp
 
@@ -188,9 +189,20 @@ class FlattenedWindowMapping(nn.Module):
 
 
 class PatchMerging3D(nn.Module):
-    def __init__(self, dim, out_dim=-1, down_scale=[2, 2, 2], norm_layer=nn.LayerNorm, diffusion=False, diff_scale=0.2):
+    def __init__(
+        self,
+        dim,
+        out_dim=-1,
+        down_scale=[2, 2, 2],
+        norm_layer=nn.LayerNorm,
+        diffusion=False,
+        diff_scale=0.2,
+        ground_guided_cfg=None,
+        debug_name='patch_merging'
+    ):
         super().__init__()
         self.dim = dim
+        self.debug_name = debug_name
 
         self.sub_conv = spconv.SparseSequential(
             spconv.SubMConv3d(dim, dim, 3, bias=False, indice_key='subm'),
@@ -209,8 +221,142 @@ class PatchMerging3D(nn.Module):
         self.diff_scale = diff_scale
 
         self.num_points = 6 #3
+        self.ground_guided_cfg = ground_guided_cfg
+        self.ground_guided_enabled = ground_guided_cfg is not None and ground_guided_cfg.get('ENABLED', False)
+        if self.ground_guided_enabled:
+            self.prior_key = ground_guided_cfg.get('PRIOR_KEY', 'coarse_observed_ground_prior')
+            self.ablation_mode = ground_guided_cfg.get('ABLATION_MODE', 'response_plus_learned_trust')
+            self.pure_ground_threshold = float(ground_guided_cfg.get('PURE_GROUND_THRESHOLD', 0.95))
+            self.guided_metric_interval = max(int(ground_guided_cfg.get('LOG_METRICS_EVERY', 50)), 1)
+            prior_component_weights = ground_guided_cfg.get('PRIOR_COMPONENT_WEIGHTS', [1.0, 0.25, 0.25, 0.5])
+            if len(prior_component_weights) != 4:
+                raise ValueError(
+                    f'GROUND_GUIDED_DIFFUSION PRIOR_COMPONENT_WEIGHTS expects 4 values, got {prior_component_weights}'
+                )
+            self.register_buffer(
+                'prior_component_weights',
+                torch.tensor(prior_component_weights, dtype=torch.float32).view(1, 4)
+            )
+            self.fixed_prior_alpha = float(ground_guided_cfg.get('FIXED_ALPHA', 0.25))
+            self.alpha_decay_cfg = ground_guided_cfg.get('ALPHA_DECAY', None)
+            self.response_proj = nn.Linear(dim, 1, bias=False)
+            nn.init.constant_(self.response_proj.weight, 1.0 / max(float(dim), 1.0))
+            feature_scale_init = max(float(ground_guided_cfg.get('DIFFUSION_FEATURE_SCALE_INIT', 1e-3)), 1e-6)
+            self.diffusion_feature_scale_logit = nn.Parameter(
+                torch.log(torch.expm1(torch.tensor(feature_scale_init, dtype=torch.float32)))
+            )
 
-    def forward(self, x, coords_shift=1, diffusion_scale=4):
+            if self.ablation_mode == 'response_plus_learned_trust':
+                alpha_init = max(float(ground_guided_cfg.get('LEARNED_ALPHA_INIT', 0.05)), 1e-4)
+                self.prior_alpha_logit = nn.Parameter(torch.log(torch.expm1(torch.tensor(alpha_init, dtype=torch.float32))))
+                self.prior_trust_logit = nn.Parameter(
+                    torch.tensor(float(ground_guided_cfg.get('TRUST_LOGIT_INIT', -4.0)), dtype=torch.float32)
+                )
+            elif self.ablation_mode not in ('response_only', 'response_plus_fixed_prior'):
+                raise ValueError(f'Unsupported GROUND_GUIDED_DIFFUSION ablation mode: {self.ablation_mode}')
+
+    def _get_alpha_decay_multiplier(self, prior_context, device, dtype):
+        if self.alpha_decay_cfg is None or not self.alpha_decay_cfg.get('ENABLED', False):
+            return torch.ones((), device=device, dtype=dtype)
+
+        warmup_steps = max(int(self.alpha_decay_cfg.get('WARMUP_STEPS', 0)), 1)
+        global_step = max(int(prior_context.get('global_step', 0)), 0)
+        start_multiplier = float(self.alpha_decay_cfg.get('START_MULTIPLIER', 0.0))
+        end_multiplier = float(self.alpha_decay_cfg.get('END_MULTIPLIER', 1.0))
+        progress = min(float(global_step) / float(warmup_steps), 1.0)
+        multiplier = start_multiplier + (end_multiplier - start_multiplier) * progress
+        return torch.tensor(multiplier, device=device, dtype=dtype)
+
+    def _get_resized_prior_maps(self, prior_context, target_hw, device, dtype):
+        if prior_context is None:
+            return None
+        prior_maps = prior_context.get('prior_maps', None)
+        if prior_maps is None:
+            return None
+
+        cache = prior_context.setdefault('resized_prior_cache', {})
+        cache_key = tuple(int(x) for x in target_hw)
+        if cache_key not in cache:
+            resized_prior = prior_maps
+            if resized_prior.shape[-2:] != cache_key:
+                resized_prior = F.interpolate(
+                    resized_prior, size=cache_key, mode='bilinear', align_corners=False
+                )
+            cache[cache_key] = resized_prior
+        return cache[cache_key].to(device=device, dtype=dtype)
+
+    def _record_ground_guided_metrics(self, prior_context, metric_dict):
+        if prior_context is None:
+            return
+        tb_dict = prior_context.setdefault('tb_dict', {})
+        for key, value in metric_dict.items():
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                value = float(value.detach().item())
+            tb_dict[f'ground_guided/{self.debug_name}/{key}'] = float(value)
+
+    def _should_record_guided_metrics(self, prior_context):
+        if not self.ground_guided_enabled or prior_context is None:
+            return False
+        if not self.training:
+            return True
+        global_step = max(int(prior_context.get('global_step', 0)), 0)
+        return (global_step % self.guided_metric_interval) == 0
+
+    def _compute_guided_scores(self, x, prior_context):
+        if not self.ground_guided_enabled:
+            response_score = x.features.mean(-1)
+            return response_score, response_score, None
+
+        learned_response = self.response_proj(x.features).squeeze(-1)
+        if self.ablation_mode == 'response_only':
+            return learned_response, learned_response, {
+                'alpha': learned_response.new_zeros(()),
+                'trust': learned_response.new_zeros(()),
+            }
+
+        resized_prior_maps = self._get_resized_prior_maps(
+            prior_context=prior_context,
+            target_hw=(x.spatial_shape[1], x.spatial_shape[2]),
+            device=x.features.device,
+            dtype=x.features.dtype
+        )
+        if resized_prior_maps is None:
+            return learned_response, learned_response, {
+                'alpha': learned_response.new_zeros(()),
+                'trust': learned_response.new_zeros(()),
+            }
+
+        batch_idx = x.indices[:, 0].long()
+        y_idx = x.indices[:, 2].long()
+        x_idx = x.indices[:, 3].long()
+        prior_components = resized_prior_maps[batch_idx, :, y_idx, x_idx]
+        prior_bias = (prior_components * self.prior_component_weights.to(prior_components.dtype)).sum(-1)
+        prior_bias = prior_bias * prior_components[:, 1]
+
+        if self.ablation_mode == 'response_plus_fixed_prior':
+            alpha = learned_response.new_tensor(self.fixed_prior_alpha)
+            trust = learned_response.new_ones(())
+        else:
+            alpha = F.softplus(self.prior_alpha_logit).to(device=learned_response.device, dtype=learned_response.dtype)
+            trust = torch.sigmoid(self.prior_trust_logit).to(device=learned_response.device, dtype=learned_response.dtype)
+            alpha = alpha * trust
+
+        alpha = alpha * self._get_alpha_decay_multiplier(
+            prior_context=prior_context,
+            device=learned_response.device,
+            dtype=learned_response.dtype
+        )
+        guided_score = learned_response + alpha * prior_bias
+        return learned_response, guided_score, {
+            'prior_components': prior_components,
+            'prior_bias': prior_bias,
+            'alpha': alpha,
+            'trust': trust,
+        }
+
+    def forward(self, x, coords_shift=1, diffusion_scale=4, prior_context=None):
         assert diffusion_scale==4 or diffusion_scale==2
         x = self.sub_conv(x)
 
@@ -218,20 +364,52 @@ class PatchMerging3D(nn.Module):
         down_scale = self.down_scale
 
         if self.diffusion:
-            x_feat_att = x.features.mean(-1)
-            batch_size = x.indices[:, 0].max() + 1
-            selected_diffusion_feats_list = [x.features.clone()]
-            selected_diffusion_coords_list = [x.indices.clone()]
+            response_score, x_feat_att, guided_debug = self._compute_guided_scores(x, prior_context)
+            batch_size = int(x.indices[:, 0].max().item()) + 1 if x.indices.numel() > 0 else int(x.batch_size)
+            record_guided_metrics = guided_debug is not None and self._should_record_guided_metrics(prior_context)
+            selected_diffusion_feats_list = [x.features]
+            selected_diffusion_coords_list = [x.indices]
+            topk_valid_ratio = [] if record_guided_metrics else None
+            topk_boundary_ratio = [] if record_guided_metrics else None
+            topk_pure_ground_ratio = [] if record_guided_metrics else None
+            topk_prior_bias_mean = [] if record_guided_metrics else None
+            topk_response_mean = [] if record_guided_metrics else None
+            topk_guided_score_mean = [] if record_guided_metrics else None
+            batch_indices = x.indices[:, 0]
+            guided_prior_components = None
+            guided_prior_bias = None
+            if record_guided_metrics:
+                guided_prior_components = guided_debug.get('prior_components', None)
+                guided_prior_bias = guided_debug.get('prior_bias', None)
+            diffusion_feature_scale = None
+            if self.ground_guided_enabled:
+                diffusion_feature_scale = F.softplus(self.diffusion_feature_scale_logit).to(
+                    device=x.features.device, dtype=x.features.dtype
+                )
             for i in range(batch_size):
-                mask = x.indices[:, 0] == i
-                valid_num = mask.sum()
-                K = int(valid_num * self.diff_scale)
-                _, indices = torch.topk(x_feat_att[mask], K)
+                selected_idx = torch.nonzero(batch_indices == i, as_tuple=False).squeeze(1)
+                valid_num = int(selected_idx.numel())
+                if valid_num == 0:
+                    continue
+                K = max(1, min(valid_num, int(math.ceil(valid_num * self.diff_scale))))
+                masked_scores = x_feat_att.index_select(0, selected_idx)
+                if K == valid_num:
+                    topk_local_indices = torch.arange(valid_num, device=selected_idx.device)
+                else:
+                    _, topk_local_indices = torch.topk(masked_scores, K, sorted=False)
+                selected_topk_idx = selected_idx.index_select(0, topk_local_indices)
 
-                selected_coords_copy = x.indices[mask][indices].clone()
+                selected_coords_copy = x.indices.index_select(0, selected_topk_idx).clone()
                 selected_coords_num = selected_coords_copy.shape[0]
                 selected_coords_expand = selected_coords_copy.repeat(diffusion_scale, 1)
-                selected_feats_expand = x.features[mask][indices].repeat(diffusion_scale, 1) * 0.0
+                if self.ground_guided_enabled:
+                    selected_feature_scale = diffusion_feature_scale * torch.sigmoid(
+                        masked_scores.index_select(0, topk_local_indices)
+                    ).unsqueeze(1)
+                    selected_feats = x.features.index_select(0, selected_topk_idx) * selected_feature_scale
+                    selected_feats_expand = selected_feats.repeat(diffusion_scale, 1)
+                else:
+                    selected_feats_expand = x.features.index_select(0, selected_topk_idx).repeat(diffusion_scale, 1) * 0.0
 
 
                 selected_coords_expand[selected_coords_num * 0:selected_coords_num * 1, 3:4] = (
@@ -266,6 +444,39 @@ class PatchMerging3D(nn.Module):
 
                 selected_diffusion_coords_list.append(selected_coords_expand)
                 selected_diffusion_feats_list.append(selected_feats_expand)
+                if guided_prior_components is not None:
+                    top_prior_components = guided_prior_components.index_select(0, selected_topk_idx)
+                    topk_valid_ratio.append(top_prior_components[:, 1].mean())
+                    topk_boundary_ratio.append(top_prior_components[:, 3].mean())
+                    topk_pure_ground_ratio.append(
+                        ((top_prior_components[:, 0] >= self.pure_ground_threshold) & (top_prior_components[:, 1] >= 0.5)).float().mean()
+                    )
+                    topk_prior_bias_mean.append(guided_prior_bias.index_select(0, selected_topk_idx).mean())
+                    topk_response_mean.append(response_score.index_select(0, selected_topk_idx).mean())
+                    topk_guided_score_mean.append(x_feat_att.index_select(0, selected_topk_idx).mean())
+
+            if record_guided_metrics:
+                def _safe_mean(items):
+                    if not items:
+                        return None
+                    return torch.stack(items).mean()
+
+                input_prior_maps = None if prior_context is None else prior_context.get('prior_maps', None)
+                prior_coverage = None
+                if input_prior_maps is not None:
+                    prior_coverage = input_prior_maps[:, 1].float().mean()
+                self._record_ground_guided_metrics(prior_context, {
+                    'prior_coverage': prior_coverage,
+                    'topk_valid_ratio': _safe_mean(topk_valid_ratio),
+                    'topk_boundary_ratio': _safe_mean(topk_boundary_ratio),
+                    'topk_pure_ground_ratio': _safe_mean(topk_pure_ground_ratio),
+                    'topk_prior_bias_mean': _safe_mean(topk_prior_bias_mean),
+                    'topk_response_mean': _safe_mean(topk_response_mean),
+                    'topk_guided_score_mean': _safe_mean(topk_guided_score_mean),
+                    'diffusion_feature_scale': diffusion_feature_scale if self.ground_guided_enabled else None,
+                    'alpha': guided_debug.get('alpha', None),
+                    'trust': guided_debug.get('trust', None),
+                })
 
             coords = torch.cat(selected_diffusion_coords_list)
             final_diffusion_feats = torch.cat(selected_diffusion_feats_list)
@@ -400,9 +611,57 @@ class PositionEmbeddingLearned(nn.Module):
         return position_embedding
 
 
+class GroundEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, norm_type='LN'):
+        super().__init__()
+        norm_type = str(norm_type).upper()
+        if norm_type == 'BN':
+            norm_layer = nn.BatchNorm1d(hidden_dim, eps=1e-3, momentum=0.01)
+        elif norm_type == 'LN':
+            norm_layer = nn.LayerNorm(hidden_dim)
+        else:
+            raise ValueError(f'Unsupported GroundEncoder norm_type: {norm_type}')
+
+        self.linear1 = nn.Linear(input_dim, hidden_dim, bias=True)
+        self.norm = norm_layer
+        self.act = nn.ReLU(inplace=True)
+        self.linear2 = nn.Linear(hidden_dim, output_dim, bias=True)
+
+        nn.init.zeros_(self.linear1.bias)
+        nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, ground_context_raw):
+        if ground_context_raw.shape[0] == 0:
+            return ground_context_raw.new_zeros((0, self.linear2.out_features))
+
+        x = self.linear1(ground_context_raw)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.linear2(x)
+        return x
+
+
+class FiLMHead(nn.Module):
+    def __init__(self, context_dim, feature_dim, alpha_init=0.05, weight_std=1e-3):
+        super().__init__()
+        self.gamma = nn.Linear(context_dim, feature_dim, bias=True)
+        self.beta = nn.Linear(context_dim, feature_dim, bias=True)
+        self.alpha = nn.Parameter(torch.full((1, feature_dim), float(alpha_init), dtype=torch.float32))
+
+        nn.init.normal_(self.gamma.weight, mean=0.0, std=weight_std)
+        nn.init.zeros_(self.gamma.bias)
+        nn.init.normal_(self.beta.weight, mean=0.0, std=weight_std)
+        nn.init.zeros_(self.beta.bias)
+
+    def forward(self, context_features):
+        gamma = self.gamma(context_features)
+        beta = self.beta(context_features)
+        return gamma, beta, self.alpha
+
+
 class LIONBlock(nn.Module):
     def __init__(self, dim: int, depth: int, down_scales: list, window_shape, group_size, direction, shift=False,
-                 operator=None, layer_id=0, n_layer=0):
+                 operator=None, layer_id=0, n_layer=0, ground_guided_cfg=None, debug_prefix='lion_block'):
         super().__init__()
 
         self.down_scales = down_scales
@@ -417,7 +676,16 @@ class LIONBlock(nn.Module):
         for idx in range(depth):
             self.encoder.append(LIONLayer(dim, 1, window_shape, group_size, direction, shift[idx], operator, layer_id + idx * 2, n_layer))
             self.pos_emb_list.append(PositionEmbeddingLearned(input_channel=3, num_pos_feats=dim))
-            self.downsample_list.append(PatchMerging3D(dim, dim, down_scale=down_scales[idx], norm_layer=norm_fn))
+            self.downsample_list.append(
+                PatchMerging3D(
+                    dim,
+                    dim,
+                    down_scale=down_scales[idx],
+                    norm_layer=norm_fn,
+                    ground_guided_cfg=ground_guided_cfg,
+                    debug_name=f'{debug_prefix}_inner_down{idx + 1}'
+                )
+            )
 
         self.decoder = nn.ModuleList()
         self.decoder_norm = nn.ModuleList()
@@ -429,7 +697,7 @@ class LIONBlock(nn.Module):
             self.upsample_list.append(PatchExpanding3D(dim))
             
 
-    def forward(self, x):
+    def forward(self, x, prior_context=None):
         features = []
         index = []
 
@@ -440,7 +708,7 @@ class LIONBlock(nn.Module):
             x = replace_feature(x, pos_emb + x.features)  # x + pos_emb
             x = enc(x)
             features.append(x)
-            x, unq_inv = self.downsample_list[idx](x)
+            x, unq_inv = self.downsample_list[idx](x, prior_context=prior_context)
             index.append(unq_inv)
 
         i = 0
@@ -508,7 +776,7 @@ class MLPBlock(nn.Module):
 
 #for waymo and nuscenes, kitti, once
 class LION3DBackboneOneStride(nn.Module):
-    def __init__(self, model_cfg, input_channels, grid_size, **kwargs):
+    def __init__(self, model_cfg, input_channels, grid_size, voxel_size=None, point_cloud_range=None, point_feature_names=None, **kwargs):
         super().__init__()
 
         self.model_cfg = model_cfg
@@ -528,6 +796,36 @@ class LION3DBackboneOneStride(nn.Module):
         self.group_size = model_cfg.GROUP_SIZE
         self.layer_dim = model_cfg.LAYER_DIM
         self.linear_operator = model_cfg.OPERATOR
+        self.ground_guided_cfg = model_cfg.get('GROUND_GUIDED_DIFFUSION', None)
+        self.ground_guided_enabled = self.ground_guided_cfg is not None and self.ground_guided_cfg.get('ENABLED', False)
+        self.ground_context_cfg = model_cfg.get('GROUND_CONTEXT_FILM', None)
+        self.ground_context_enabled = self.ground_context_cfg is not None and self.ground_context_cfg.get('ENABLED', False)
+        if self.ground_guided_enabled and self.ground_context_enabled:
+            raise ValueError('GROUND_GUIDED_DIFFUSION and GROUND_CONTEXT_FILM should not be enabled together')
+        self.ground_guided_prior_key = 'coarse_observed_ground_prior'
+        if self.ground_guided_enabled:
+            self.ground_guided_prior_key = self.ground_guided_cfg.get('PRIOR_KEY', self.ground_guided_prior_key)
+        self.point_feature_names = list(point_feature_names) if point_feature_names is not None else None
+        self.ground_point_feature_indices = None
+        if self.ground_context_enabled:
+            required_names = ['is_ground', 'delta_z_to_ground', 'ground_valid']
+            if self.point_feature_names is None:
+                raise ValueError('GROUND_CONTEXT_FILM requires point_feature_names to be passed into the backbone')
+            missing_names = [name for name in required_names if name not in self.point_feature_names]
+            if missing_names:
+                raise ValueError(
+                    f'GROUND_CONTEXT_FILM requires point features {missing_names}, got {self.point_feature_names}'
+                )
+            self.ground_point_feature_indices = {
+                name: self.point_feature_names.index(name) + 1 for name in required_names
+            }
+            if voxel_size is None or point_cloud_range is None:
+                raise ValueError('GROUND_CONTEXT_FILM requires voxel_size and point_cloud_range')
+            self.register_buffer('ground_context_voxel_size', torch.tensor(voxel_size, dtype=torch.float32))
+            self.register_buffer('ground_context_point_cloud_range', torch.tensor(point_cloud_range, dtype=torch.float32))
+        else:
+            self.register_buffer('ground_context_voxel_size', torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32))
+            self.register_buffer('ground_context_point_cloud_range', torch.tensor([0.0] * 6, dtype=torch.float32))
         
         self.n_layer = len(depths) * depths[0] * 2 * 2 + 2
 
@@ -549,36 +847,83 @@ class LION3DBackboneOneStride(nn.Module):
 
         
         self.linear_1 = LIONBlock(self.layer_dim[0], depths[0], layer_down_scales[0], self.window_shape[0],
-                                    self.group_size[0], direction, shift=shift, operator=self.linear_operator, layer_id=0, n_layer=self.n_layer)  ##[27, 27, 32] --》 [13, 13, 32]
+                                    self.group_size[0], direction, shift=shift, operator=self.linear_operator, layer_id=0,
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_1')  ##[27, 27, 32] --》 [13, 13, 32]
 
         self.dow1 = PatchMerging3D(self.layer_dim[0], self.layer_dim[0], down_scale=[1, 1, 2],
-                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale)
+                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
+                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow1')
         
 
         # [944, 944, 16] -> [472, 472, 8]
         self.linear_2 = LIONBlock(self.layer_dim[1], depths[1], layer_down_scales[1], self.window_shape[1],
-                                    self.group_size[1], direction, shift=shift, operator=self.linear_operator, layer_id=8, n_layer=self.n_layer)
+                                    self.group_size[1], direction, shift=shift, operator=self.linear_operator, layer_id=8,
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_2')
 
         self.dow2 = PatchMerging3D(self.layer_dim[1], self.layer_dim[1], down_scale=[1, 1, 2],
-                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale)
+                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
+                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow2')
 
 
         #  [236, 236, 8] -> [236, 236, 4]
         self.linear_3 = LIONBlock(self.layer_dim[2], depths[2], layer_down_scales[2], self.window_shape[2],
-                                    self.group_size[2], direction, shift=shift, operator=self.linear_operator, layer_id=16, n_layer=self.n_layer)
+                                    self.group_size[2], direction, shift=shift, operator=self.linear_operator, layer_id=16,
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_3')
 
         self.dow3 = PatchMerging3D(self.layer_dim[2], self.layer_dim[3], down_scale=[1, 1, 2],
-                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale)
+                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
+                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow3')
 
         #  [236, 236, 4] -> [236, 236, 2]
         self.linear_4 = LIONBlock(self.layer_dim[3], depths[3], layer_down_scales[3], self.window_shape[3],
-                                    self.group_size[3], direction, shift=shift, operator=self.linear_operator, layer_id=24, n_layer=self.n_layer)
+                                    self.group_size[3], direction, shift=shift, operator=self.linear_operator, layer_id=24,
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_4')
 
         self.dow4 = PatchMerging3D(self.layer_dim[3], self.layer_dim[3], down_scale=[1, 1, 2],
-                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale)
+                                     norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
+                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow4')
 
         self.linear_out = LIONLayer(self.layer_dim[3], 1, [13, 13, 2], 256, direction=['x', 'y'], shift=shift,
                                       operator=self.linear_operator, layer_id=32, n_layer=self.n_layer)
+
+        self.stage_strides_xyz = [
+            [1, 1, 1],
+            [1, 1, 2],
+            [1, 1, 4],
+            [1, 1, 8],
+        ]
+        self.ground_context_metric_interval = 50
+        if self.ground_context_enabled:
+            context_dim = int(self.ground_context_cfg.get('CONTEXT_DIM', dim))
+            hidden_dim = int(self.ground_context_cfg.get('ENCODER_HIDDEN_DIM', max(context_dim, 32)))
+            norm_type = self.ground_context_cfg.get('ENCODER_NORM', 'LN')
+            alpha_init = float(self.ground_context_cfg.get('ALPHA_INIT', 0.05))
+            film_weight_std = float(self.ground_context_cfg.get('FILM_WEIGHT_STD', 1e-3))
+            mode = self.ground_context_cfg.get('MODE', None)
+            if mode is None:
+                mode = 'full' if bool(self.ground_context_cfg.get('ENABLE_FILM', True)) else 'off'
+            self.ground_context_mode = str(mode).lower()
+            if self.ground_context_mode not in ('full', 'beta_only', 'off'):
+                raise ValueError(
+                    f'GROUND_CONTEXT_FILM.MODE expects one of full/beta_only/off, got {self.ground_context_mode}'
+                )
+            self.ground_context_metric_interval = max(
+                int(self.ground_context_cfg.get('LOG_METRICS_EVERY', 50)), 1
+            )
+            self.ground_encoder = GroundEncoder(
+                input_dim=4,
+                hidden_dim=hidden_dim,
+                output_dim=context_dim,
+                norm_type=norm_type
+            )
+            self.film_heads = nn.ModuleList([
+                FiLMHead(context_dim=context_dim, feature_dim=self.layer_dim[0], alpha_init=alpha_init, weight_std=film_weight_std),
+                FiLMHead(context_dim=context_dim, feature_dim=self.layer_dim[1], alpha_init=alpha_init, weight_std=film_weight_std),
+                FiLMHead(context_dim=context_dim, feature_dim=self.layer_dim[2], alpha_init=alpha_init, weight_std=film_weight_std),
+                FiLMHead(context_dim=context_dim, feature_dim=self.layer_dim[3], alpha_init=alpha_init, weight_std=film_weight_std),
+            ])
+        else:
+            self.ground_context_mode = 'off'
 
         self.num_point_features = dim
 
@@ -589,10 +934,99 @@ class LION3DBackboneOneStride(nn.Module):
             'x_conv4': 128
         }
 
+    def build_ground_context_state(self, batch_dict):
+        if not self.ground_context_enabled:
+            return None
+        points = batch_dict.get('points', None)
+        if points is None:
+            raise KeyError('GROUND_CONTEXT_FILM requires batch_dict["points"]')
+        return {
+            'points': points,
+            'tb_dict': {},
+            'global_step': int(batch_dict.get('global_step', 0)),
+        }
+
+    def should_record_ground_context_metrics(self, ground_context_state):
+        if not self.ground_context_enabled or ground_context_state is None:
+            return False
+        if not self.training:
+            return True
+        return (ground_context_state['global_step'] % self.ground_context_metric_interval) == 0
+
+    def pool_ground_context_raw(self, points, target_coords, target_spatial_shape, stride_xyz):
+        return pool_ground_context_to_sparse_coords(
+            points=points,
+            target_coords=target_coords,
+            target_spatial_shape=target_spatial_shape,
+            voxel_size=self.ground_context_voxel_size,
+            point_cloud_range=self.ground_context_point_cloud_range,
+            stride_xyz=stride_xyz,
+            feature_indices=self.ground_point_feature_indices
+        )
+
+    def apply_ground_context_film(self, x, stage_idx, ground_context_raw, ground_context_state=None):
+        if not self.ground_context_enabled:
+            return x
+
+        context_features = self.ground_encoder(ground_context_raw)
+        gamma, beta, alpha = self.film_heads[stage_idx](context_features)
+        if self.ground_context_mode == 'full':
+            modulated = x.features * (1.0 + alpha * torch.tanh(gamma)) + alpha * beta
+        elif self.ground_context_mode == 'beta_only':
+            modulated = x.features + alpha * beta
+        else:
+            modulated = x.features
+
+        if self.should_record_ground_context_metrics(ground_context_state):
+            valid_ratio = ground_context_raw[:, 3] if ground_context_raw.shape[0] > 0 else modulated.new_zeros((0,))
+            ground_ratio = ground_context_raw[:, 2] if ground_context_raw.shape[0] > 0 else modulated.new_zeros((0,))
+            delta_feature = modulated - x.features
+            stage_name = f'stage{stage_idx + 1}'
+            tb_dict = ground_context_state['tb_dict']
+            tb_dict[f'ground_context/{stage_name}/valid_ratio_mean'] = float(
+                valid_ratio.mean().detach().item()
+            ) if valid_ratio.numel() > 0 else 0.0
+            tb_dict[f'ground_context/{stage_name}/ground_ratio_mean'] = float(
+                ground_ratio.mean().detach().item()
+            ) if ground_ratio.numel() > 0 else 0.0
+            tb_dict[f'ground_context/{stage_name}/context_norm_mean'] = float(
+                context_features.norm(dim=1).mean().detach().item()
+            ) if context_features.numel() > 0 else 0.0
+            tb_dict[f'ground_context/{stage_name}/alpha_abs_mean'] = float(alpha.abs().mean().detach().item())
+            tb_dict[f'ground_context/{stage_name}/gamma_abs_mean'] = float(gamma.abs().mean().detach().item()) if gamma.numel() > 0 else 0.0
+            tb_dict[f'ground_context/{stage_name}/beta_abs_mean'] = float(beta.abs().mean().detach().item()) if beta.numel() > 0 else 0.0
+            tb_dict[f'ground_context/{stage_name}/delta_rel_l2'] = float(
+                (delta_feature.norm() / x.features.norm().clamp_min(1e-6)).detach().item()
+            ) if x.features.numel() > 0 else 0.0
+            mode_value = {'off': 0.0, 'beta_only': 1.0, 'full': 2.0}[self.ground_context_mode]
+            tb_dict[f'ground_context/{stage_name}/mode_id'] = mode_value
+
+        return replace_feature(x, modulated)
+
+    def build_ground_guided_prior_context(self, batch_dict):
+        if not self.ground_guided_enabled:
+            return None
+
+        prior_maps = batch_dict.get(self.ground_guided_prior_key, None)
+        if prior_maps is None:
+            return None
+        if prior_maps.dim() != 4 or prior_maps.shape[1] != 4:
+            raise ValueError(
+                f'{self.ground_guided_prior_key} expects shape [B, 4, H, W], got {tuple(prior_maps.shape)}'
+            )
+        return {
+            'global_step': int(batch_dict.get('global_step', 0)),
+            'prior_maps': prior_maps,
+            'tb_dict': {},
+            'resized_prior_cache': {},
+        }
+
     def forward(self, batch_dict):
         voxel_features = batch_dict['voxel_features']
         voxel_coords = batch_dict['voxel_coords']
         batch_size = batch_dict['batch_size']
+        prior_context = self.build_ground_guided_prior_context(batch_dict)
+        ground_context_state = self.build_ground_context_state(batch_dict)
 
         x = spconv.SparseConvTensor(
             features=voxel_features,
@@ -601,14 +1035,48 @@ class LION3DBackboneOneStride(nn.Module):
             batch_size=batch_size
         )
 
-        x = self.linear_1(x)
-        x1, _ = self.dow1(x)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
-        x = self.linear_2(x1)
-        x2, _ = self.dow2(x)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
-        x = self.linear_3(x2)
-        x3, _ = self.dow3(x)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
-        x = self.linear_4(x3)
-        x4, _ = self.dow4(x)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
+        if self.ground_context_enabled:
+            stage0_raw = batch_dict.get('voxel_ground_context_raw', None)
+            if stage0_raw is None or stage0_raw.shape[0] != voxel_coords.shape[0]:
+                stage0_raw = self.pool_ground_context_raw(
+                    points=ground_context_state['points'],
+                    target_coords=x.indices,
+                    target_spatial_shape=x.spatial_shape,
+                    stride_xyz=self.stage_strides_xyz[0]
+                )
+            x = self.apply_ground_context_film(x, 0, stage0_raw, ground_context_state=ground_context_state)
+        x = self.linear_1(x, prior_context=prior_context)
+        x1, _ = self.dow1(x, prior_context=prior_context)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
+        if self.ground_context_enabled:
+            stage1_raw = self.pool_ground_context_raw(
+                points=ground_context_state['points'],
+                target_coords=x1.indices,
+                target_spatial_shape=x1.spatial_shape,
+                stride_xyz=self.stage_strides_xyz[1]
+            )
+            x1 = self.apply_ground_context_film(x1, 1, stage1_raw, ground_context_state=ground_context_state)
+        x = self.linear_2(x1, prior_context=prior_context)
+        x2, _ = self.dow2(x, prior_context=prior_context)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
+        if self.ground_context_enabled:
+            stage2_raw = self.pool_ground_context_raw(
+                points=ground_context_state['points'],
+                target_coords=x2.indices,
+                target_spatial_shape=x2.spatial_shape,
+                stride_xyz=self.stage_strides_xyz[2]
+            )
+            x2 = self.apply_ground_context_film(x2, 2, stage2_raw, ground_context_state=ground_context_state)
+        x = self.linear_3(x2, prior_context=prior_context)
+        x3, _ = self.dow3(x, prior_context=prior_context)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
+        if self.ground_context_enabled:
+            stage3_raw = self.pool_ground_context_raw(
+                points=ground_context_state['points'],
+                target_coords=x3.indices,
+                target_spatial_shape=x3.spatial_shape,
+                stride_xyz=self.stage_strides_xyz[3]
+            )
+            x3 = self.apply_ground_context_film(x3, 3, stage3_raw, ground_context_state=ground_context_state)
+        x = self.linear_4(x3, prior_context=prior_context)
+        x4, _ = self.dow4(x, prior_context=prior_context)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
         x = self.linear_out(x4)
 
         batch_dict.update({
@@ -632,6 +1100,10 @@ class LION3DBackboneOneStride(nn.Module):
                 'x_conv4': torch.tensor([1,1,16], device=x1.features.device).float(),
             }
         })
+        if prior_context is not None and prior_context['tb_dict']:
+            batch_dict['ground_guided_tb_dict'] = prior_context['tb_dict']
+        if ground_context_state is not None and ground_context_state['tb_dict']:
+            batch_dict['ground_context_tb_dict'] = ground_context_state['tb_dict']
 
         return batch_dict
 
