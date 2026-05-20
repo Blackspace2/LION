@@ -1,5 +1,6 @@
 import glob
 import os
+import shutil
 
 import torch
 import tqdm
@@ -17,6 +18,19 @@ except:
 
 
 
+def _set_frozen_batchnorm_eval(model):
+    module = model.module if hasattr(model, 'module') else model
+    if not getattr(module, '_freeze_bn_when_frozen', False):
+        return
+
+    for submodule in module.modules():
+        if not isinstance(submodule, torch.nn.modules.batchnorm._BatchNorm):
+            continue
+        params = list(submodule.parameters(recurse=False))
+        if len(params) > 0 and all(not param.requires_grad for param in params):
+            submodule.eval()
+
+
 def _snapshot_bn_running_buffers(model):
     module = model.module if hasattr(model, 'module') else model
     return {
@@ -32,6 +46,67 @@ def _restore_bn_running_buffers(model, snapshot):
     for name, saved in snapshot.items():
         if name in buffers:
             buffers[name].copy_(saved)
+
+
+def _collect_named_grad_norms(model):
+    module = model.module if hasattr(model, 'module') else model
+    model_cfg = getattr(module, 'model_cfg', None)
+    if model_cfg is None:
+        return {}
+
+    keywords = []
+    backbone_cfg = getattr(model_cfg, 'BACKBONE_3D', None)
+    if backbone_cfg is not None:
+        guided_cfg = backbone_cfg.get('GROUND_GUIDED_DIFFUSION', None)
+        if guided_cfg is not None and guided_cfg.get('ENABLED', False):
+            keywords.extend(
+                list(
+                    guided_cfg.get(
+                        'GRAD_LOG_KEYWORDS',
+                        ['response_proj', 'prior_alpha_logit', 'prior_trust_logit', 'diffusion_feature_scale_logit']
+                    )
+                )
+            )
+
+    map_to_bev_cfg = getattr(model_cfg, 'MAP_TO_BEV', None)
+    if map_to_bev_cfg is not None and map_to_bev_cfg.get('NAME', None) == 'GroundDefectHeightCompression':
+        keywords.extend(
+            list(
+                map_to_bev_cfg.get(
+                    'GRAD_LOG_KEYWORDS',
+                    [
+                        'map_to_bev_module.defect_encoder',
+                        'map_to_bev_module.defect_head',
+                        'map_to_bev_module.gate_head',
+                        'map_to_bev_module.residual_head',
+                        'map_to_bev_module.residual_scale',
+                    ]
+                )
+            )
+        )
+
+    if len(keywords) == 0:
+        return {}
+
+    grad_norms = {}
+    total_sq_norm = 0.0
+    total_matches = 0
+    for keyword in keywords:
+        sq_norm = None
+        for name, param in module.named_parameters():
+            if keyword not in name or param.grad is None:
+                continue
+            grad_value = param.grad.detach().float().norm().pow(2)
+            sq_norm = grad_value if sq_norm is None else sq_norm + grad_value
+        if sq_norm is not None:
+            norm_value = sq_norm.sqrt()
+            grad_norms[f'grad_norm/{keyword}'] = float(norm_value.item())
+            total_sq_norm += float(sq_norm.item())
+            total_matches += 1
+
+    if total_matches > 0:
+        grad_norms['grad_norm/auxiliary_total'] = total_sq_norm ** 0.5
+    return grad_norms
 
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
@@ -88,6 +163,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
 
         model.train()
+        _set_frozen_batchnorm_eval(model)
         optimizer.zero_grad()
 
         skipped_nonfinite = False
@@ -132,6 +208,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 # unscale gradient for clip gradient
                 scaler.unscale_(optimizer)
                 total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+                tb_dict.update(_collect_named_grad_norms(model))
                 if torch.isfinite(total_norm):
                     scaler.step(optimizer)
                     scaler.update()
@@ -147,6 +224,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             else:
                 loss.backward()
                 total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+                tb_dict.update(_collect_named_grad_norms(model))
                 if torch.isfinite(total_norm):
                     optimizer.step()
                 else:
@@ -223,8 +301,9 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                                 f'{disp_str}')
                     if show_gpu_stat and accumulated_iter % (3 * logger_iter_interval) == 0:
                         # To show the GPU utilization, please install gpustat through "pip install gpustat"
-                        gpu_info = os.popen('gpustat').read()
-                        logger.info(gpu_info)
+                        if shutil.which('gpustat') is not None:
+                            gpu_info = os.popen('gpustat').read()
+                            logger.info(gpu_info)
                     
                     loss_disp.reset()  # WHY
                     hm_loss_disp.reset()
