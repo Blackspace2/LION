@@ -1,13 +1,17 @@
 import copy
+import contextlib
+import io as pyio
+import os
 import pickle
 from pathlib import Path
 
 import numpy as np
-from skimage import io
+from skimage import io as skio
 
 from . import kitti_utils
 from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 from ...utils import box_utils, calibration_kitti, common_utils, object3d_kitti
+from ..augmentor import database_sampler
 from ..dataset import DatasetTemplate
 
 
@@ -31,6 +35,8 @@ class KittiDataset(DatasetTemplate):
         self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
 
         self.kitti_infos = []
+        self._ground_segmenter = None
+        self.refresh_ground_prior_state()
         self.include_kitti_data(self.mode)
 
     def include_kitti_data(self, mode):
@@ -60,6 +66,38 @@ class KittiDataset(DatasetTemplate):
 
         split_dir = self.root_path / 'ImageSets' / (self.split + '.txt')
         self.sample_id_list = [x.strip() for x in open(split_dir).readlines()] if split_dir.exists() else None
+        self._ground_segmenter = None
+        self.refresh_ground_prior_state()
+
+    def refresh_ground_prior_state(self):
+        self.ground_prior_cfg = self.dataset_cfg.get('GROUND_PRIOR', None)
+        self.ground_prior_enabled = self.ground_prior_cfg is not None and self.ground_prior_cfg.get('ENABLED', False)
+        self.ground_defect_guidance_enabled = self.ground_prior_enabled and self.ground_prior_cfg.get(
+            'GROUND_DEFECT_GUIDANCE_ENABLED', False
+        )
+        self.ground_context_film_enabled = self.ground_prior_enabled and self.ground_prior_cfg.get(
+            'GROUND_CONTEXT_FILM_ENABLED', False
+        )
+        if self.ground_defect_guidance_enabled and self.ground_context_film_enabled:
+            raise ValueError('GROUND_DEFECT_GUIDANCE_ENABLED and GROUND_CONTEXT_FILM_ENABLED cannot both be True')
+        self.custom_ground_feature_enabled = self.ground_defect_guidance_enabled or self.ground_context_film_enabled
+        self.legacy_ground_prior_enabled = (
+            self.ground_prior_enabled and
+            not self.ground_defect_guidance_enabled and
+            not self.ground_context_film_enabled
+        )
+        if self.ground_context_film_enabled:
+            self.point_feature_names = (
+                'is_ground',
+                'delta_z_to_ground',
+                'ground_valid',
+            )
+        else:
+            self.point_feature_names = (
+                'is_ground',
+                'delta_z_to_ground',
+                'local_ground_height',
+            )
 
     def get_lidar(self, idx):
         lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % idx)
@@ -76,7 +114,7 @@ class KittiDataset(DatasetTemplate):
         """
         img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
         assert img_file.exists()
-        image = io.imread(img_file)
+        image = skio.imread(img_file)
         image = image.astype(np.float32)
         image /= 255.0
         return image
@@ -84,7 +122,7 @@ class KittiDataset(DatasetTemplate):
     def get_image_shape(self, idx):
         img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
         assert img_file.exists()
-        return np.array(io.imread(img_file).shape[:2], dtype=np.int32)
+        return np.array(skio.imread(img_file).shape[:2], dtype=np.int32)
 
     def get_label(self, idx):
         label_file = self.root_split_path / 'label_2' / ('%s.txt' % idx)
@@ -101,7 +139,7 @@ class KittiDataset(DatasetTemplate):
         """
         depth_file = self.root_split_path / 'depth_2' / ('%s.png' % idx)
         assert depth_file.exists()
-        depth = io.imread(depth_file)
+        depth = skio.imread(depth_file)
         depth = depth.astype(np.float32)
         depth /= 256.0
         return depth
@@ -128,6 +166,542 @@ class KittiDataset(DatasetTemplate):
         norm = np.linalg.norm(plane[0:3])
         plane = plane / norm
         return plane
+
+    @contextlib.contextmanager
+    def suppress_native_stdio(self):
+        saved_stdout_fd = os.dup(1)
+        saved_stderr_fd = os.dup(2)
+        try:
+            with open(os.devnull, 'w') as devnull:
+                os.dup2(devnull.fileno(), 1)
+                os.dup2(devnull.fileno(), 2)
+                with contextlib.redirect_stdout(pyio.StringIO()), contextlib.redirect_stderr(pyio.StringIO()):
+                    yield
+        finally:
+            os.dup2(saved_stdout_fd, 1)
+            os.dup2(saved_stderr_fd, 2)
+            os.close(saved_stdout_fd)
+            os.close(saved_stderr_fd)
+
+    def get_ground_segmenter(self):
+        if self._ground_segmenter is not None:
+            return self._ground_segmenter
+
+        try:
+            import linefit_bind
+        except ImportError as exc:
+            raise ImportError('GROUND_PRIOR enabled but linefit_bind is not available') from exc
+
+        config_path = self.ground_prior_cfg.get('LINEFIT_CONFIG', None)
+        with self.suppress_native_stdio():
+            if config_path is not None:
+                self._ground_segmenter = linefit_bind.ground_seg(str(Path(config_path).expanduser()))
+            else:
+                self._ground_segmenter = linefit_bind.ground_seg()
+        return self._ground_segmenter
+
+    def infer_ground_point_labels(self, points):
+        if points.shape[0] == 0:
+            return np.zeros((0,), dtype=np.float32)
+
+        ground_segmenter = self.get_ground_segmenter()
+        with self.suppress_native_stdio():
+            labels = np.asarray(ground_segmenter.run(points[:, :3]), dtype=np.uint8)
+        if labels.shape[0] != points.shape[0]:
+            raise RuntimeError(
+                f'linefit returned mismatched labels: {labels.shape[0]} vs points {points.shape[0]}'
+            )
+        return labels.astype(np.float32)
+
+    def build_ground_prior_cell_stats(self, points, point_ground_labels):
+        if point_ground_labels is None:
+            raise ValueError('point_ground_labels is required to build coarse observed ground prior')
+
+        map_h = int(self.grid_size[1])
+        map_w = int(self.grid_size[0])
+        total_counts = np.zeros((map_h, map_w), dtype=np.float32)
+        ground_counts = np.zeros((map_h, map_w), dtype=np.float32)
+        if points.shape[0] == 0:
+            return total_counts, ground_counts
+
+        mask = common_utils.mask_points_by_range_v2(points[:, :3], self.point_cloud_range)
+        if not np.any(mask):
+            return total_counts, ground_counts
+
+        points = points[mask]
+        point_ground_labels = point_ground_labels[mask]
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        pc_range_min = self.point_cloud_range[:3]
+
+        x_idx = np.floor((points[:, 0] - pc_range_min[0]) / voxel_size[0]).astype(np.int32)
+        y_idx = np.floor((points[:, 1] - pc_range_min[1]) / voxel_size[1]).astype(np.int32)
+
+        valid = (
+            (x_idx >= 0) & (x_idx < map_w) &
+            (y_idx >= 0) & (y_idx < map_h)
+        )
+        if not np.any(valid):
+            return total_counts, ground_counts
+
+        x_idx = x_idx[valid]
+        y_idx = y_idx[valid]
+        point_ground_labels = point_ground_labels[valid]
+
+        np.add.at(total_counts, (y_idx, x_idx), 1.0)
+        np.add.at(ground_counts, (y_idx, x_idx), point_ground_labels)
+        return total_counts, ground_counts
+
+    @staticmethod
+    def build_ground_boundary_map(ground_ratio_map, ground_valid_mask_map, ratio_threshold=0.5):
+        valid = ground_valid_mask_map.astype(bool)
+        majority_ground = ground_ratio_map >= ratio_threshold
+        boundary_map = np.logical_and(valid, np.logical_and(ground_ratio_map > 0.0, ground_ratio_map < 1.0))
+
+        vertical_diff = (
+            valid[:-1, :] & valid[1:, :] &
+            (majority_ground[:-1, :] != majority_ground[1:, :])
+        )
+        boundary_map[:-1, :] |= vertical_diff
+        boundary_map[1:, :] |= vertical_diff
+
+        horizontal_diff = (
+            valid[:, :-1] & valid[:, 1:] &
+            (majority_ground[:, :-1] != majority_ground[:, 1:])
+        )
+        boundary_map[:, :-1] |= horizontal_diff
+        boundary_map[:, 1:] |= horizontal_diff
+        return boundary_map.astype(np.float32)
+
+    def build_coarse_observed_ground_prior(self, points, point_ground_labels):
+        total_counts, ground_counts = self.build_ground_prior_cell_stats(points, point_ground_labels)
+        valid_cells = total_counts > 0
+        ground_ratio_map = np.zeros_like(total_counts, dtype=np.float32)
+        ground_ratio_map[valid_cells] = ground_counts[valid_cells] / total_counts[valid_cells]
+
+        ground_valid_mask_map = valid_cells.astype(np.float32)
+        ground_density_map = np.log1p(total_counts)
+        density_max = float(ground_density_map.max())
+        if density_max > 0:
+            ground_density_map /= density_max
+
+        boundary_threshold = float(self.ground_prior_cfg.get('BOUNDARY_GROUND_RATIO_THRESHOLD', 0.5))
+        ground_boundary_map = self.build_ground_boundary_map(
+            ground_ratio_map=ground_ratio_map,
+            ground_valid_mask_map=ground_valid_mask_map,
+            ratio_threshold=boundary_threshold
+        )
+
+        coarse_observed_ground_prior = np.stack(
+            [ground_ratio_map, ground_valid_mask_map, ground_density_map, ground_boundary_map],
+            axis=0
+        ).astype(np.float32)
+        prior_dict = {
+            'coarse_observed_ground_prior': coarse_observed_ground_prior,
+            'ground_ratio_map': ground_ratio_map,
+            'ground_valid_mask_map': ground_valid_mask_map,
+            'ground_density_map': ground_density_map,
+            'ground_boundary_map': ground_boundary_map,
+        }
+        if self.ground_prior_cfg.get('EXPORT_LEGACY_GROUND_BEV_MAP', True):
+            prior_dict['ground_bev_map'] = ground_ratio_map
+        return prior_dict
+
+    def get_ground_feature_index_map(self):
+        feature_names = list(self.point_feature_encoder.src_feature_list)
+        missing_features = [name for name in self.point_feature_names if name not in feature_names]
+        if missing_features:
+            raise KeyError(
+                'Ground-aware feature pipeline requires POINT_FEATURE_ENCODING.src_feature_list to include '
+                f'{missing_features}, but got {feature_names}'
+            )
+        return {name: feature_names.index(name) for name in self.point_feature_names}
+
+    @staticmethod
+    def fit_local_ground_plane(points_xyz):
+        if points_xyz.shape[0] < 3:
+            return None, None
+
+        design = np.concatenate(
+            [points_xyz[:, :2].astype(np.float64), np.ones((points_xyz.shape[0], 1), dtype=np.float64)],
+            axis=1
+        )
+        target = points_xyz[:, 2].astype(np.float64)
+        try:
+            plane_params, _, rank, _ = np.linalg.lstsq(design, target, rcond=None)
+        except np.linalg.LinAlgError:
+            return None, None
+
+        if rank < 3:
+            return None, None
+
+        predicted = design @ plane_params
+        residual = predicted - target
+        rmse = float(np.sqrt(np.mean(residual ** 2))) if residual.size > 0 else None
+        return plane_params.astype(np.float32), rmse
+
+    def build_local_ground_surface_features(self, points, point_ground_labels):
+        local_ground_height = np.zeros(points.shape[0], dtype=np.float32)
+        delta_z_to_ground = np.zeros(points.shape[0], dtype=np.float32)
+        ground_valid = np.zeros(points.shape[0], dtype=np.float32)
+
+        if points.shape[0] == 0:
+            return local_ground_height, delta_z_to_ground, ground_valid
+
+        mask = common_utils.mask_points_by_range_v2(points[:, :3], self.point_cloud_range)
+        if not np.any(mask):
+            return local_ground_height, delta_z_to_ground, ground_valid
+
+        min_ground_points = int(self.ground_prior_cfg.get('GROUND_VALID_MIN_GROUND_POINTS', 5))
+        max_rmse = float(self.ground_prior_cfg.get('GROUND_VALID_MAX_RMSE', 0.10))
+        max_support_dist = float(self.ground_prior_cfg.get('GROUND_VALID_MAX_SUPPORT_XY_DIST', 0.40))
+        neighborhood_radius = int(self.ground_prior_cfg.get('GROUND_VALID_NEIGHBOR_RADIUS', 1))
+
+        map_h = int(self.grid_size[1])
+        map_w = int(self.grid_size[0])
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        pc_range_min = self.point_cloud_range[:3]
+
+        point_indices = np.where(mask)[0]
+        points_in_range = points[point_indices]
+        labels_in_range = point_ground_labels[point_indices] > 0.5
+
+        x_idx = np.floor((points_in_range[:, 0] - pc_range_min[0]) / voxel_size[0]).astype(np.int32)
+        y_idx = np.floor((points_in_range[:, 1] - pc_range_min[1]) / voxel_size[1]).astype(np.int32)
+        valid_idx = (
+            (x_idx >= 0) & (x_idx < map_w) &
+            (y_idx >= 0) & (y_idx < map_h)
+        )
+        if not np.any(valid_idx):
+            return local_ground_height, delta_z_to_ground, ground_valid
+
+        point_indices = point_indices[valid_idx]
+        points_in_range = points_in_range[valid_idx]
+        labels_in_range = labels_in_range[valid_idx]
+        x_idx = x_idx[valid_idx]
+        y_idx = y_idx[valid_idx]
+
+        occupied_cells = {}
+        ground_cells = {}
+        for local_idx, (cell_y, cell_x) in enumerate(zip(y_idx.tolist(), x_idx.tolist())):
+            cell_key = (cell_y, cell_x)
+            occupied_cells.setdefault(cell_key, []).append(local_idx)
+            if labels_in_range[local_idx]:
+                ground_cells.setdefault(cell_key, []).append(local_idx)
+
+        for cell_key, local_point_indices in occupied_cells.items():
+            cell_y, cell_x = cell_key
+            support_local_indices = []
+            for off_y in range(-neighborhood_radius, neighborhood_radius + 1):
+                neighbor_y = cell_y + off_y
+                if neighbor_y < 0 or neighbor_y >= map_h:
+                    continue
+                for off_x in range(-neighborhood_radius, neighborhood_radius + 1):
+                    neighbor_x = cell_x + off_x
+                    if neighbor_x < 0 or neighbor_x >= map_w:
+                        continue
+                    support_local_indices.extend(ground_cells.get((neighbor_y, neighbor_x), ()))
+
+            if len(support_local_indices) < min_ground_points:
+                continue
+
+            support_local_indices = np.asarray(support_local_indices, dtype=np.int32)
+            support_points_xyz = points_in_range[support_local_indices, :3]
+            plane_params, rmse = self.fit_local_ground_plane(support_points_xyz)
+            if plane_params is None or rmse is None or rmse > max_rmse:
+                continue
+
+            query_points = points_in_range[local_point_indices, :3]
+            query_xy = query_points[:, :2].astype(np.float32)
+            support_xy = support_points_xyz[:, :2].astype(np.float32)
+            pairwise_sq_dist = (
+                (query_xy[:, None, 0] - support_xy[None, :, 0]) ** 2 +
+                (query_xy[:, None, 1] - support_xy[None, :, 1]) ** 2
+            )
+            min_support_dist = np.sqrt(pairwise_sq_dist.min(axis=1))
+            reliable_mask = min_support_dist <= max_support_dist
+            if not np.any(reliable_mask):
+                continue
+
+            reliable_global_indices = point_indices[np.asarray(local_point_indices, dtype=np.int32)[reliable_mask]]
+            reliable_points = points[reliable_global_indices, :3]
+            z_ground = (
+                plane_params[0] * reliable_points[:, 0] +
+                plane_params[1] * reliable_points[:, 1] +
+                plane_params[2]
+            )
+            local_ground_height[reliable_global_indices] = z_ground.astype(np.float32)
+            delta_z_to_ground[reliable_global_indices] = (
+                reliable_points[:, 2] - z_ground
+            ).astype(np.float32)
+            ground_valid[reliable_global_indices] = 1.0
+
+        return local_ground_height, delta_z_to_ground, ground_valid
+
+    def attach_ground_point_features(self, data_dict):
+        if data_dict.get('ground_point_feature_indices', None) is not None:
+            return data_dict
+
+        points = data_dict.get('points', None)
+        if points is None:
+            return data_dict
+
+        ground_feature_indices = self.get_ground_feature_index_map()
+        point_ground_labels = self.infer_ground_point_labels(points)
+        local_ground_height, delta_z_to_ground, ground_valid = self.build_local_ground_surface_features(
+            points=points,
+            point_ground_labels=point_ground_labels
+        )
+
+        if self.ground_context_film_enabled:
+            appended_features = np.stack(
+                [
+                    point_ground_labels.astype(np.float32),
+                    delta_z_to_ground.astype(np.float32),
+                    ground_valid.astype(np.float32),
+                ],
+                axis=1
+            )
+        else:
+            appended_features = np.stack(
+                [
+                    point_ground_labels.astype(np.float32),
+                    delta_z_to_ground.astype(np.float32),
+                    local_ground_height.astype(np.float32),
+                ],
+                axis=1
+            )
+        data_dict['points'] = np.concatenate([points, appended_features], axis=1)
+        data_dict['ground_point_feature_indices'] = ground_feature_indices
+        return data_dict
+
+    def build_object_footprint_mask(self, gt_boxes):
+        map_h = int(self.grid_size[1])
+        map_w = int(self.grid_size[0])
+        footprint_mask = np.zeros((map_h, map_w), dtype=np.float32)
+        if gt_boxes is None or gt_boxes.shape[0] == 0:
+            return footprint_mask
+
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        pc_range_min = self.point_cloud_range[:3]
+        x_centers = pc_range_min[0] + (np.arange(map_w, dtype=np.float32) + 0.5) * voxel_size[0]
+        y_centers = pc_range_min[1] + (np.arange(map_h, dtype=np.float32) + 0.5) * voxel_size[1]
+        grid_x, grid_y = np.meshgrid(x_centers, y_centers)
+
+        for box in gt_boxes[:, :7]:
+            dx = float(box[3]) * 0.5
+            dy = float(box[4]) * 0.5
+            if dx <= 0 or dy <= 0:
+                continue
+
+            rel_x = grid_x - float(box[0])
+            rel_y = grid_y - float(box[1])
+            cos_heading = float(np.cos(box[6]))
+            sin_heading = float(np.sin(box[6]))
+            local_x = rel_x * cos_heading + rel_y * sin_heading
+            local_y = -rel_x * sin_heading + rel_y * cos_heading
+            in_box = (np.abs(local_x) <= dx) & (np.abs(local_y) <= dy)
+            footprint_mask[in_box] = 1.0
+
+        return footprint_mask
+
+    def build_ground_defect_supervision(self, data_dict):
+        if not self.ground_defect_guidance_enabled or data_dict.get('points', None) is None:
+            return data_dict
+
+        ground_feature_indices = data_dict.get('ground_point_feature_indices', None)
+        if ground_feature_indices is None:
+            raise KeyError('ground_point_feature_indices is missing before building ground defect supervision')
+
+        points = data_dict['points']
+        map_h = int(self.grid_size[1])
+        map_w = int(self.grid_size[0])
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        pc_range_min = self.point_cloud_range[:3]
+        mask = common_utils.mask_points_by_range_v2(points[:, :3], self.point_cloud_range)
+
+        ground_ratio_map = np.zeros((map_h, map_w), dtype=np.float32)
+        ground_height_map = np.zeros((map_h, map_w), dtype=np.float32)
+        height_residual_map = np.zeros((map_h, map_w), dtype=np.float32)
+        near_non_ground_map = np.zeros((map_h, map_w), dtype=np.float32)
+        valid_ground_mask = np.zeros((map_h, map_w), dtype=np.float32)
+        boundary_valid_mask = np.zeros((map_h, map_w), dtype=np.float32)
+
+        if np.any(mask):
+            points_in_range = points[mask]
+            x_idx = np.floor((points_in_range[:, 0] - pc_range_min[0]) / voxel_size[0]).astype(np.int32)
+            y_idx = np.floor((points_in_range[:, 1] - pc_range_min[1]) / voxel_size[1]).astype(np.int32)
+            valid = (
+                (x_idx >= 0) & (x_idx < map_w) &
+                (y_idx >= 0) & (y_idx < map_h)
+            )
+            if np.any(valid):
+                points_in_range = points_in_range[valid]
+                x_idx = x_idx[valid]
+                y_idx = y_idx[valid]
+
+                total_counts = np.zeros((map_h, map_w), dtype=np.float32)
+                ground_counts = np.zeros((map_h, map_w), dtype=np.float32)
+                ground_height_sum = np.zeros((map_h, map_w), dtype=np.float32)
+                residual_sum = np.zeros((map_h, map_w), dtype=np.float32)
+                residual_count = np.zeros((map_h, map_w), dtype=np.float32)
+                near_non_ground_counts = np.zeros((map_h, map_w), dtype=np.float32)
+
+                is_ground = points_in_range[:, ground_feature_indices['is_ground']] > 0.5
+                delta_z = points_in_range[:, ground_feature_indices['delta_z_to_ground']]
+                local_ground_height = points_in_range[:, ground_feature_indices['local_ground_height']]
+
+                np.add.at(total_counts, (y_idx, x_idx), 1.0)
+                np.add.at(ground_counts, (y_idx, x_idx), is_ground.astype(np.float32))
+                np.add.at(
+                    ground_height_sum,
+                    (y_idx[is_ground], x_idx[is_ground]),
+                    local_ground_height[is_ground]
+                )
+
+                valid_cells = total_counts > 0
+                valid_ground_cells = ground_counts > 0
+                ground_ratio_map[valid_cells] = ground_counts[valid_cells] / total_counts[valid_cells]
+                valid_ground_mask = valid_ground_cells.astype(np.float32)
+                ground_height_map[valid_ground_cells] = (
+                    ground_height_sum[valid_ground_cells] / ground_counts[valid_ground_cells]
+                )
+                boundary_valid_mask = valid_cells.astype(np.float32)
+
+                non_ground = np.logical_not(is_ground) & valid_ground_cells[y_idx, x_idx]
+                if np.any(non_ground):
+                    delta_clip = float(self.ground_prior_cfg.get('DELTA_Z_CLIP', 3.0))
+                    near_threshold = float(self.ground_prior_cfg.get('NEAR_GROUND_DELTA_Z', 0.5))
+                    clipped_delta = np.clip(delta_z[non_ground], 0.0, delta_clip)
+                    np.add.at(residual_sum, (y_idx[non_ground], x_idx[non_ground]), clipped_delta)
+                    np.add.at(residual_count, (y_idx[non_ground], x_idx[non_ground]), 1.0)
+
+                    near_non_ground = np.logical_and(
+                        delta_z[non_ground] > 0.0,
+                        delta_z[non_ground] <= near_threshold
+                    )
+                    np.add.at(
+                        near_non_ground_counts,
+                        (y_idx[non_ground][near_non_ground], x_idx[non_ground][near_non_ground]),
+                        1.0
+                    )
+
+                residual_cells = residual_count > 0
+                height_residual_map[residual_cells] = residual_sum[residual_cells] / residual_count[residual_cells]
+
+                density_norm = float(np.log1p(max(1.0, near_non_ground_counts.max())))
+                if density_norm > 0:
+                    near_non_ground_map = np.log1p(near_non_ground_counts) / density_norm
+
+        ground_height_norm = float(self.ground_prior_cfg.get('GROUND_HEIGHT_NORM', 3.0))
+        delta_z_norm = float(self.ground_prior_cfg.get('DELTA_Z_NORM', 2.0))
+        if ground_height_norm > 0:
+            ground_height_map = np.clip(ground_height_map / ground_height_norm, -1.0, 1.0)
+        if delta_z_norm > 0:
+            height_residual_map = np.clip(height_residual_map / delta_z_norm, 0.0, 1.0)
+
+        ground_boundary_map = self.build_ground_boundary_map(
+            ground_ratio_map=ground_ratio_map,
+            ground_valid_mask_map=boundary_valid_mask,
+            ratio_threshold=float(self.ground_prior_cfg.get('BOUNDARY_GROUND_RATIO_THRESHOLD', 0.5))
+        )
+
+        data_dict['ground_defect_bev_map'] = np.stack(
+            [
+                ground_ratio_map,
+                ground_height_map,
+                height_residual_map,
+                near_non_ground_map,
+                ground_boundary_map,
+            ],
+            axis=0
+        ).astype(np.float32)
+        data_dict['ground_defect_valid_mask'] = valid_ground_mask.astype(np.float32)
+        data_dict['ground_defect_footprint_mask'] = self.build_object_footprint_mask(
+            data_dict.get('gt_boxes', None)
+        ).astype(np.float32)
+        return data_dict
+
+    def apply_training_augmentor_with_ground_features(self, data_dict):
+        assert self.data_augmentor is not None
+        augmentor_dict = {
+            **data_dict,
+            'gt_boxes_mask': np.array([n in self.class_names for n in data_dict['gt_names']], dtype=np.bool_)
+        }
+        ground_features_attached = False
+        has_gt_sampler = any(
+            isinstance(cur_augmentor, database_sampler.DataBaseSampler)
+            for cur_augmentor in self.data_augmentor.data_augmentor_queue
+        )
+
+        if self.custom_ground_feature_enabled and not has_gt_sampler:
+            augmentor_dict = self.attach_ground_point_features(augmentor_dict)
+            ground_features_attached = True
+
+        for cur_augmentor in self.data_augmentor.data_augmentor_queue:
+            augmentor_dict = cur_augmentor(data_dict=augmentor_dict)
+            if (
+                self.custom_ground_feature_enabled and
+                not ground_features_attached and
+                isinstance(cur_augmentor, database_sampler.DataBaseSampler)
+            ):
+                augmentor_dict = self.attach_ground_point_features(augmentor_dict)
+                ground_features_attached = True
+
+        if self.custom_ground_feature_enabled and not ground_features_attached:
+            augmentor_dict = self.attach_ground_point_features(augmentor_dict)
+
+        augmentor_dict['gt_boxes'][:, 6] = common_utils.limit_period(
+            augmentor_dict['gt_boxes'][:, 6], offset=0.5, period=2 * np.pi
+        )
+        if 'road_plane' in augmentor_dict:
+            augmentor_dict.pop('road_plane')
+        if 'gt_boxes_mask' in augmentor_dict:
+            gt_boxes_mask = augmentor_dict.pop('gt_boxes_mask')
+            augmentor_dict['gt_boxes'] = augmentor_dict['gt_boxes'][gt_boxes_mask]
+            augmentor_dict['gt_names'] = augmentor_dict['gt_names'][gt_boxes_mask]
+            if 'gt_boxes2d' in augmentor_dict:
+                augmentor_dict['gt_boxes2d'] = augmentor_dict['gt_boxes2d'][gt_boxes_mask]
+
+        return augmentor_dict
+
+    def prepare_data(self, data_dict):
+        if not self.custom_ground_feature_enabled:
+            return super().prepare_data(data_dict)
+
+        if self.training:
+            assert 'gt_boxes' in data_dict, 'gt_boxes should be provided for training'
+            calib = data_dict.get('calib', None)
+            data_dict = self.apply_training_augmentor_with_ground_features(data_dict)
+            if calib is not None:
+                data_dict['calib'] = calib
+        elif data_dict.get('points', None) is not None:
+            data_dict = self.attach_ground_point_features(data_dict)
+
+        if data_dict.get('gt_boxes', None) is not None:
+            selected = common_utils.keep_arrays_by_name(data_dict['gt_names'], self.class_names)
+            data_dict['gt_boxes'] = data_dict['gt_boxes'][selected]
+            data_dict['gt_names'] = data_dict['gt_names'][selected]
+            gt_classes = np.array([self.class_names.index(n) + 1 for n in data_dict['gt_names']], dtype=np.int32)
+            gt_boxes = np.concatenate((data_dict['gt_boxes'], gt_classes.reshape(-1, 1).astype(np.float32)), axis=1)
+            data_dict['gt_boxes'] = gt_boxes
+            if data_dict.get('gt_boxes2d', None) is not None:
+                data_dict['gt_boxes2d'] = data_dict['gt_boxes2d'][selected]
+
+        if self.ground_defect_guidance_enabled:
+            data_dict = self.build_ground_defect_supervision(data_dict)
+
+        if data_dict.get('points', None) is not None:
+            data_dict = self.point_feature_encoder.forward(data_dict)
+
+        data_dict = self.data_processor.forward(data_dict=data_dict)
+
+        if self.training and len(data_dict['gt_boxes']) == 0:
+            new_index = np.random.randint(self.__len__())
+            return self.__getitem__(new_index)
+
+        data_dict.pop('gt_names', None)
+        data_dict.pop('ground_point_feature_indices', None)
+        return data_dict
 
     @staticmethod
     def get_fov_flag(pts_rect, img_shape, calib):
@@ -412,6 +986,8 @@ class KittiDataset(DatasetTemplate):
                 fov_flag = self.get_fov_flag(pts_rect, img_shape, calib)
                 points = points[fov_flag]
             input_dict['points'] = points
+            if self.legacy_ground_prior_enabled:
+                input_dict['point_ground_labels'] = self.infer_ground_point_labels(points)
 
         if "images" in get_item_list:
             input_dict['images'] = self.get_image(sample_idx)
@@ -424,6 +1000,15 @@ class KittiDataset(DatasetTemplate):
 
         input_dict['calib'] = calib
         data_dict = self.prepare_data(data_dict=input_dict)
+        if self.legacy_ground_prior_enabled and 'coarse_observed_ground_prior' not in data_dict:
+            point_ground_labels = data_dict.pop('point_ground_labels', None)
+            if point_ground_labels is not None:
+                data_dict.update(
+                    self.build_coarse_observed_ground_prior(
+                        points=data_dict['points'],
+                        point_ground_labels=point_ground_labels
+                    )
+                )
 
         data_dict['image_shape'] = img_shape
         return data_dict
