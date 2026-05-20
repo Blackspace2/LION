@@ -10,15 +10,17 @@ except Exception as e:
 
 from .vfe_template import VFETemplate
 from .dynamic_pillar_vfe import PFNLayerV2
+from ..ground_context_utils import build_voxel_ground_context_from_inv
 
 
 class DynamicVoxelVFE(VFETemplate):
-    def __init__(self, model_cfg, num_point_features, voxel_size, grid_size, point_cloud_range, **kwargs):
+    def __init__(self, model_cfg, num_point_features, voxel_size, grid_size, point_cloud_range, point_feature_names=None, **kwargs):
         super().__init__(model_cfg=model_cfg)
 
         self.use_norm = self.model_cfg.USE_NORM
         self.with_distance = self.model_cfg.WITH_DISTANCE
         self.use_absolute_xyz = self.model_cfg.USE_ABSLOTE_XYZ
+        self.return_ground_context = bool(self.model_cfg.get('GROUND_CONTEXT_ENABLED', False))
         num_point_features += 6 if self.use_absolute_xyz else 3
         if self.with_distance:
             num_point_features += 1
@@ -50,6 +52,20 @@ class DynamicVoxelVFE(VFETemplate):
         self.grid_size = torch.tensor(grid_size).cuda()
         self.voxel_size = torch.tensor(voxel_size).cuda()
         self.point_cloud_range = torch.tensor(point_cloud_range).cuda()
+        self.point_feature_names = list(point_feature_names) if point_feature_names is not None else None
+        self.ground_feature_indices = None
+        if self.return_ground_context:
+            required_names = ['is_ground', 'delta_z_to_ground', 'ground_valid']
+            if self.point_feature_names is None:
+                raise ValueError('GROUND_CONTEXT_ENABLED requires point_feature_names to be passed into DynamicVoxelVFE')
+            missing_names = [name for name in required_names if name not in self.point_feature_names]
+            if missing_names:
+                raise ValueError(
+                    f'GROUND_CONTEXT_ENABLED requires point features {missing_names}, got {self.point_feature_names}'
+                )
+            self.ground_feature_indices = {
+                name: self.point_feature_names.index(name) + 1 for name in required_names
+            }
 
     def get_output_feature_dim(self):
         return self.num_filters[-1]
@@ -102,5 +118,12 @@ class DynamicVoxelVFE(VFETemplate):
 
         batch_dict['pillar_features'] = batch_dict['voxel_features'] = features
         batch_dict['voxel_coords'] = voxel_coords
+        if self.return_ground_context:
+            batch_dict['voxel_ground_context_raw'] = build_voxel_ground_context_from_inv(
+                points=points,
+                unq_inv=unq_inv,
+                num_voxels=int(voxel_coords.shape[0]),
+                feature_indices=self.ground_feature_indices
+            )
 
         return batch_dict
