@@ -18,6 +18,70 @@ from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_utils import train_model
 
 
+def apply_train_freeze(model, cfg, logger):
+    freeze_cfg = cfg.get('TRAIN_FREEZE', None)
+    if freeze_cfg is None or not freeze_cfg.get('ENABLED', False):
+        return
+
+    trainable_prefixes = list(freeze_cfg.get('TRAINABLE_PREFIXES', []))
+    frozen_prefixes = list(freeze_cfg.get('FROZEN_PREFIXES', []))
+    trainable_keywords = list(freeze_cfg.get('TRAINABLE_KEYWORDS', []))
+    frozen_keywords = list(freeze_cfg.get('FROZEN_KEYWORDS', []))
+
+    enabled_groups = [
+        bool(trainable_prefixes),
+        bool(frozen_prefixes),
+        bool(trainable_keywords),
+        bool(frozen_keywords),
+    ]
+    if sum(int(flag) for flag in enabled_groups) != 1:
+        raise ValueError(
+            'TRAIN_FREEZE requires exactly one of TRAINABLE_PREFIXES, FROZEN_PREFIXES, '
+            'TRAINABLE_KEYWORDS, or FROZEN_KEYWORDS'
+        )
+
+    matched_names = []
+    trainable_names = []
+    frozen_names = []
+    for name, param in model.named_parameters():
+        if trainable_prefixes:
+            is_trainable = any(name.startswith(prefix) for prefix in trainable_prefixes)
+            matched = is_trainable
+        elif trainable_keywords:
+            is_trainable = any(keyword in name for keyword in trainable_keywords)
+            matched = is_trainable
+        elif frozen_prefixes:
+            matched = any(name.startswith(prefix) for prefix in frozen_prefixes)
+            is_trainable = not matched
+        else:
+            matched = any(keyword in name for keyword in frozen_keywords)
+            is_trainable = not matched
+
+        param.requires_grad = is_trainable
+        if is_trainable:
+            trainable_names.append(name)
+        else:
+            frozen_names.append(name)
+
+        if matched:
+            matched_names.append(name)
+
+    if len(matched_names) == 0:
+        rule_desc = (
+            trainable_prefixes or frozen_prefixes or trainable_keywords or frozen_keywords
+        )
+        raise ValueError(f'TRAIN_FREEZE rules matched no parameters: {rule_desc}')
+
+    model._freeze_bn_when_frozen = bool(freeze_cfg.get('FREEZE_BN_RUNNING_STATS', True))
+    logger.info('Applied TRAIN_FREEZE configuration')
+    logger.info(f'Trainable params: {len(trainable_names)}, frozen params: {len(frozen_names)}')
+    logger.info(f'TRAIN_FREEZE matched parameter count: {len(matched_names)}')
+    for name in matched_names[:20]:
+        logger.info(f'  TRAIN_FREEZE matched: {name}')
+    if len(matched_names) > 20:
+        logger.info(f'  ... {len(matched_names) - 20} more matched parameters')
+
+
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config for training')
@@ -133,13 +197,15 @@ def main():
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
 
-    optimizer = build_optimizer(model, cfg.OPTIMIZATION)
-
     # load checkpoint if it is possible
     start_epoch = it = 0
     last_epoch = -1
     if args.pretrained_model is not None:
         model.load_params_from_file(filename=args.pretrained_model, to_cpu=dist_train, logger=logger)
+
+    apply_train_freeze(model, cfg, logger)
+
+    optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 
     if args.ckpt is not None:
         it, start_epoch = model.load_params_with_optimizer(args.ckpt, to_cpu=dist_train, optimizer=optimizer, logger=logger)
