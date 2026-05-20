@@ -42,6 +42,8 @@ def parse_config():
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     parser.add_argument('--output_dir', type=Path, default=None, help='root directory for experiment outputs')
     parser.add_argument('--infer_time', action='store_true', default=False, help='calculate inference latency')
+    parser.add_argument('--skip_dataset_eval', action='store_true', default=False,
+                        help='skip dataset.evaluation and only dump result.pkl / recall stats')
 
     args = parser.parse_args()
 
