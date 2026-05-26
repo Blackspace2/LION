@@ -227,6 +227,10 @@ START_EPOCH="${START_EPOCH:-1}"
 END_EPOCH="${END_EPOCH:-999999}"
 FIX_RANDOM_SEED="${FIX_RANDOM_SEED:-1}"
 FP16="${FP16:-0}"
+DISABLE_GT_SAMPLING_FOR_SUBSET="${DISABLE_GT_SAMPLING_FOR_SUBSET:-1}"
+ENABLE_EMA="${ENABLE_EMA:-0}"
+EMA_DECAY="${EMA_DECAY:-0.999}"
+SAVE_EMA_AS_MODEL="${SAVE_EMA_AS_MODEL:-1}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/project/LION/output/LION_output}"
 DATA_PATH="${DATA_PATH:-/root/autodl-tmp/kitti-offical}"
@@ -394,6 +398,12 @@ require_dir() {
   fi
 }
 
+uses_train_subset() {
+  [[ -n "${TRAIN_SPLIT_NAME}" && "${TRAIN_SPLIT_NAME}" != "train" ]] && return 0
+  [[ -n "${TRAIN_INFO_PKL}" && "${TRAIN_INFO_PKL}" != "kitti_infos_train.pkl" ]] && return 0
+  return 1
+}
+
 append_context_film_variant_set_args() {
   case "${VARIANT}" in
     ""|full_film)
@@ -460,6 +470,10 @@ append_train_set_args() {
   fi
   if [[ -n "${TRAIN_INFO_PKL}" ]]; then
     SET_ARGS+=(DATA_CONFIG.INFO_PATH.train "['${TRAIN_INFO_PKL}']")
+  fi
+  if [[ "${DISABLE_GT_SAMPLING_FOR_SUBSET}" == "1" ]] && uses_train_subset; then
+    echo "Subset train data detected; disabling gt_sampling. Set DISABLE_GT_SAMPLING_FOR_SUBSET=0 to override."
+    SET_ARGS+=(DATA_CONFIG.DATA_AUGMENTOR.DISABLE_AUG_LIST "['gt_sampling']")
   fi
   if [[ -n "${TEST_SPLIT_NAME}" ]]; then
     SET_ARGS+=(DATA_CONFIG.DATA_SPLIT.test "${TEST_SPLIT_NAME}")
@@ -726,6 +740,13 @@ run_train_once() {
 
   if [[ "${FP16}" == "1" ]]; then
     cmd+=(--fp16)
+  fi
+
+  if [[ "${ENABLE_EMA}" == "1" ]]; then
+    cmd+=(--ema --ema_decay "${EMA_DECAY}")
+    if [[ "${SAVE_EMA_AS_MODEL}" == "1" ]]; then
+      cmd+=(--save_ema_as_model)
+    fi
   fi
 
   if [[ -n "${pretrained_ckpt}" ]]; then
