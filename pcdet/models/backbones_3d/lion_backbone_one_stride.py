@@ -1,5 +1,6 @@
 from functools import partial
 
+import os
 import math
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ from ..model_utils.rwkv_cls import Block as RWKVBlock
 from ..model_utils.vision_lstm2 import xLSTM_Block
 from ..model_utils.ttt import TTTBlock
 from .ground_context_utils import pool_ground_context_to_sparse_coords
+from .patch_context_utils import PATCH_CONTEXT_RAW_DIM, pool_patch_context_to_sparse_coords
+from .sbsd import SBSD
 from ...utils.spconv_utils import replace_feature, spconv
 import torch.utils.checkpoint as cp
 
@@ -198,11 +201,15 @@ class PatchMerging3D(nn.Module):
         diffusion=False,
         diff_scale=0.2,
         ground_guided_cfg=None,
+        sbsd_cfg=None,
+        point_cloud_range=None,
         debug_name='patch_merging'
     ):
         super().__init__()
         self.dim = dim
         self.debug_name = debug_name
+        self._logged_sub_conv_input = False
+        self.sbsd = SBSD(dim, sbsd_cfg, point_cloud_range=point_cloud_range) if sbsd_cfg is not None else None
 
         self.sub_conv = spconv.SparseSequential(
             spconv.SubMConv3d(dim, dim, 3, bias=False, indice_key='subm'),
@@ -358,6 +365,17 @@ class PatchMerging3D(nn.Module):
 
     def forward(self, x, coords_shift=1, diffusion_scale=4, prior_context=None):
         assert diffusion_scale==4 or diffusion_scale==2
+        if os.getenv('LION_LOG_SUB_CONV_INPUT', '0') == '1' and not self._logged_sub_conv_input:
+            print(
+                '[LION_SUB_CONV_INPUT] '
+                f'name={self.debug_name} '
+                f'N={int(x.features.shape[0])} '
+                f'dim={int(x.features.shape[1])} '
+                f'spatial_shape={tuple(int(v) for v in x.spatial_shape)}'
+            )
+            self._logged_sub_conv_input = True
+        if self.sbsd is not None:
+            x = self.sbsd(x)
         x = self.sub_conv(x)
 
         d, h, w = x.spatial_shape
@@ -611,6 +629,34 @@ class PositionEmbeddingLearned(nn.Module):
         return position_embedding
 
 
+class PatchTopologyEmbedding(nn.Module):
+    def __init__(self, output_dim, num_zone_embeddings=8, num_ring_embeddings=16, num_sector_embeddings=128):
+        super().__init__()
+        topo_dim = max(output_dim // 4, 8)
+        self.zone_emb = nn.Embedding(num_zone_embeddings, topo_dim)
+        self.ring_emb = nn.Embedding(num_ring_embeddings, topo_dim)
+        self.sector_emb = nn.Embedding(num_sector_embeddings, topo_dim)
+        self.proj = nn.Linear(topo_dim * 3, output_dim, bias=True)
+        nn.init.normal_(self.zone_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.ring_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.sector_emb.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, zone_ids, ring_ids, sector_ids):
+        zone_ids = zone_ids.long().clamp_min(-1) + 1
+        ring_ids = ring_ids.long().clamp_min(-1) + 1
+        sector_ids = sector_ids.long().clamp_min(-1) + 1
+        zone_ids = zone_ids.clamp(max=self.zone_emb.num_embeddings - 1)
+        ring_ids = ring_ids.clamp(max=self.ring_emb.num_embeddings - 1)
+        sector_ids = sector_ids.clamp(max=self.sector_emb.num_embeddings - 1)
+        topo = torch.cat([
+            self.zone_emb(zone_ids),
+            self.ring_emb(ring_ids),
+            self.sector_emb(sector_ids),
+        ], dim=-1)
+        return self.proj(topo)
+
+
 class GroundEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, norm_type='LN'):
         super().__init__()
@@ -661,7 +707,8 @@ class FiLMHead(nn.Module):
 
 class LIONBlock(nn.Module):
     def __init__(self, dim: int, depth: int, down_scales: list, window_shape, group_size, direction, shift=False,
-                 operator=None, layer_id=0, n_layer=0, ground_guided_cfg=None, debug_prefix='lion_block'):
+                 operator=None, layer_id=0, n_layer=0, ground_guided_cfg=None, sbsd_cfg=None, debug_prefix='lion_block',
+                 pos_input_channel=3, point_cloud_range=None):
         super().__init__()
 
         self.down_scales = down_scales
@@ -675,7 +722,7 @@ class LIONBlock(nn.Module):
         shift = [False, shift]
         for idx in range(depth):
             self.encoder.append(LIONLayer(dim, 1, window_shape, group_size, direction, shift[idx], operator, layer_id + idx * 2, n_layer))
-            self.pos_emb_list.append(PositionEmbeddingLearned(input_channel=3, num_pos_feats=dim))
+            self.pos_emb_list.append(PositionEmbeddingLearned(input_channel=pos_input_channel, num_pos_feats=dim))
             self.downsample_list.append(
                 PatchMerging3D(
                     dim,
@@ -683,6 +730,8 @@ class LIONBlock(nn.Module):
                     down_scale=down_scales[idx],
                     norm_layer=norm_fn,
                     ground_guided_cfg=ground_guided_cfg,
+                    sbsd_cfg=sbsd_cfg,
+                    point_cloud_range=point_cloud_range,
                     debug_name=f'{debug_prefix}_inner_down{idx + 1}'
                 )
             )
@@ -697,13 +746,21 @@ class LIONBlock(nn.Module):
             self.upsample_list.append(PatchExpanding3D(dim))
             
 
-    def forward(self, x, prior_context=None):
+    def forward(self, x, prior_context=None, patch_pos_context=None, patch_topology_embed=None):
         features = []
         index = []
 
         for idx, enc in enumerate(self.encoder):
+            cur_patch_pos = patch_pos_context if (
+                patch_pos_context is not None and patch_pos_context.shape[0] == x.indices.shape[0]
+            ) else None
+            cur_patch_topology = patch_topology_embed if (
+                patch_topology_embed is not None and patch_topology_embed.shape[0] == x.indices.shape[0]
+            ) else None
             pos_emb = self.get_pos_embed(spatial_shape=x.spatial_shape, coors=x.indices[:, 1:],
-                                         embed_layer=self.pos_emb_list[idx])
+                                         embed_layer=self.pos_emb_list[idx],
+                                         patch_pos_context=cur_patch_pos,
+                                         patch_topology_embed=cur_patch_topology)
 
             x = replace_feature(x, pos_emb + x.features)  # x + pos_emb
             x = enc(x)
@@ -720,7 +777,8 @@ class LIONBlock(nn.Module):
             i = i + 1
         return x
 
-    def get_pos_embed(self, spatial_shape, coors, embed_layer, normalize_pos=True):
+    def get_pos_embed(self, spatial_shape, coors, embed_layer, normalize_pos=True,
+                      patch_pos_context=None, patch_topology_embed=None):
         '''
         Args:
         coors_in_win: shape=[N, 3], order: z, y, x
@@ -756,7 +814,15 @@ class LIONBlock(nn.Module):
             z = torch.zeros_like(x)
 
         location = torch.stack((x, y, z), dim=-1)
+        if patch_pos_context is not None:
+            location = torch.cat([location, patch_pos_context], dim=-1)
+        expected_in_features = embed_layer.position_embedding_head[0].in_features
+        if location.shape[1] < expected_in_features:
+            pad = location.new_zeros((location.shape[0], expected_in_features - location.shape[1]))
+            location = torch.cat([location, pad], dim=-1)
         pos_embed = embed_layer(location)
+        if patch_topology_embed is not None:
+            pos_embed = pos_embed + patch_topology_embed
 
         return pos_embed
     
@@ -798,15 +864,29 @@ class LION3DBackboneOneStride(nn.Module):
         self.linear_operator = model_cfg.OPERATOR
         self.ground_guided_cfg = model_cfg.get('GROUND_GUIDED_DIFFUSION', None)
         self.ground_guided_enabled = self.ground_guided_cfg is not None and self.ground_guided_cfg.get('ENABLED', False)
+        self.sbsd_cfg = model_cfg.get('SBSD', None)
         self.ground_context_cfg = model_cfg.get('GROUND_CONTEXT_FILM', None)
         self.ground_context_enabled = self.ground_context_cfg is not None and self.ground_context_cfg.get('ENABLED', False)
-        if self.ground_guided_enabled and self.ground_context_enabled:
-            raise ValueError('GROUND_GUIDED_DIFFUSION and GROUND_CONTEXT_FILM should not be enabled together')
+        self.patchwork_guidance_cfg = model_cfg.get('PATCHWORK_GUIDANCE', None)
+        self.patchwork_guidance_enabled = (
+            self.patchwork_guidance_cfg is not None and self.patchwork_guidance_cfg.get('ENABLED', False)
+        )
+        enabled_guidance_modes = sum([
+            int(self.ground_guided_enabled),
+            int(self.ground_context_enabled),
+            int(self.patchwork_guidance_enabled),
+        ])
+        if enabled_guidance_modes > 1:
+            raise ValueError(
+                'GROUND_GUIDED_DIFFUSION, GROUND_CONTEXT_FILM, and PATCHWORK_GUIDANCE cannot be enabled together'
+            )
         self.ground_guided_prior_key = 'coarse_observed_ground_prior'
         if self.ground_guided_enabled:
             self.ground_guided_prior_key = self.ground_guided_cfg.get('PRIOR_KEY', self.ground_guided_prior_key)
         self.point_feature_names = list(point_feature_names) if point_feature_names is not None else None
         self.ground_point_feature_indices = None
+        self.patch_point_feature_indices = None
+        self.patch_position_input_dim = 5 if self.patchwork_guidance_enabled else 3
         if self.ground_context_enabled:
             required_names = ['is_ground', 'delta_z_to_ground', 'ground_valid']
             if self.point_feature_names is None:
@@ -826,6 +906,36 @@ class LION3DBackboneOneStride(nn.Module):
         else:
             self.register_buffer('ground_context_voxel_size', torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32))
             self.register_buffer('ground_context_point_cloud_range', torch.tensor([0.0] * 6, dtype=torch.float32))
+        if self.patchwork_guidance_enabled:
+            required_names = [
+                'is_ground',
+                'patch_center_z',
+                'patch_normal_z',
+                'patch_flatness',
+                'patch_elevation',
+                'patch_point_count',
+                'patch_zone_id',
+                'patch_ring_id',
+                'patch_sector_id',
+                'point_patch_id',
+            ]
+            if self.point_feature_names is None:
+                raise ValueError('PATCHWORK_GUIDANCE requires point_feature_names to be passed into the backbone')
+            missing_names = [name for name in required_names if name not in self.point_feature_names]
+            if missing_names:
+                raise ValueError(
+                    f'PATCHWORK_GUIDANCE requires point features {missing_names}, got {self.point_feature_names}'
+                )
+            self.patch_point_feature_indices = {
+                name: self.point_feature_names.index(name) + 1 for name in required_names
+            }
+            if voxel_size is None or point_cloud_range is None:
+                raise ValueError('PATCHWORK_GUIDANCE requires voxel_size and point_cloud_range')
+            self.register_buffer('patch_context_voxel_size', torch.tensor(voxel_size, dtype=torch.float32))
+            self.register_buffer('patch_context_point_cloud_range', torch.tensor(point_cloud_range, dtype=torch.float32))
+        else:
+            self.register_buffer('patch_context_voxel_size', torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32))
+            self.register_buffer('patch_context_point_cloud_range', torch.tensor([0.0] * 6, dtype=torch.float32))
         
         self.n_layer = len(depths) * depths[0] * 2 * 2 + 2
 
@@ -848,7 +958,8 @@ class LION3DBackboneOneStride(nn.Module):
         
         self.linear_1 = LIONBlock(self.layer_dim[0], depths[0], layer_down_scales[0], self.window_shape[0],
                                     self.group_size[0], direction, shift=shift, operator=self.linear_operator, layer_id=0,
-                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_1')  ##[27, 27, 32] --》 [13, 13, 32]
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_1',
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)  ##[27, 27, 32] --》 [13, 13, 32]
 
         self.dow1 = PatchMerging3D(self.layer_dim[0], self.layer_dim[0], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
@@ -858,7 +969,8 @@ class LION3DBackboneOneStride(nn.Module):
         # [944, 944, 16] -> [472, 472, 8]
         self.linear_2 = LIONBlock(self.layer_dim[1], depths[1], layer_down_scales[1], self.window_shape[1],
                                     self.group_size[1], direction, shift=shift, operator=self.linear_operator, layer_id=8,
-                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_2')
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_2',
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)
 
         self.dow2 = PatchMerging3D(self.layer_dim[1], self.layer_dim[1], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
@@ -868,7 +980,8 @@ class LION3DBackboneOneStride(nn.Module):
         #  [236, 236, 8] -> [236, 236, 4]
         self.linear_3 = LIONBlock(self.layer_dim[2], depths[2], layer_down_scales[2], self.window_shape[2],
                                     self.group_size[2], direction, shift=shift, operator=self.linear_operator, layer_id=16,
-                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_3')
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_3',
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)
 
         self.dow3 = PatchMerging3D(self.layer_dim[2], self.layer_dim[3], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
@@ -877,7 +990,8 @@ class LION3DBackboneOneStride(nn.Module):
         #  [236, 236, 4] -> [236, 236, 2]
         self.linear_4 = LIONBlock(self.layer_dim[3], depths[3], layer_down_scales[3], self.window_shape[3],
                                     self.group_size[3], direction, shift=shift, operator=self.linear_operator, layer_id=24,
-                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, debug_prefix='linear_4')
+                                    n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_4',
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)
 
         self.dow4 = PatchMerging3D(self.layer_dim[3], self.layer_dim[3], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
@@ -892,6 +1006,7 @@ class LION3DBackboneOneStride(nn.Module):
             [1, 1, 4],
             [1, 1, 8],
         ]
+        self.output_stride_xyz = [1, 1, 16]
         self.ground_context_metric_interval = 50
         if self.ground_context_enabled:
             context_dim = int(self.ground_context_cfg.get('CONTEXT_DIM', dim))
@@ -924,6 +1039,101 @@ class LION3DBackboneOneStride(nn.Module):
             ])
         else:
             self.ground_context_mode = 'off'
+
+        self.patchwork_metric_interval = 50
+        self.forward_ret_dict = {}
+        if self.patchwork_guidance_enabled:
+            patch_dim = dim
+            hidden_dim = int(self.patchwork_guidance_cfg.get('HIDDEN_DIM', max(dim, 64)))
+            norm_type = self.patchwork_guidance_cfg.get('ENCODER_NORM', 'LN')
+            residual_scale_init = float(self.patchwork_guidance_cfg.get('RESIDUAL_SCALE_INIT', 0.01))
+            weight_std = float(self.patchwork_guidance_cfg.get('GUIDANCE_WEIGHT_STD', 1e-3))
+            logit_bias_init = float(self.patchwork_guidance_cfg.get('LOGIT_BIAS_INIT', -2.0))
+            gate_bias_init = float(self.patchwork_guidance_cfg.get('GATE_BIAS_INIT', -1.5))
+            aux_loss_weight = float(self.patchwork_guidance_cfg.get('AUX_LOSS_WEIGHT', 0.02))
+            self.patch_guidance_num_classes = int(
+                self.patchwork_guidance_cfg.get('GUIDANCE_NUM_CLASSES', len(getattr(model_cfg, 'CLASS_NAMES', [])) or 3)
+            )
+            self.patchwork_metric_interval = max(
+                int(self.patchwork_guidance_cfg.get('LOG_METRICS_EVERY', 50)), 1
+            )
+            self.patch_aux_loss_weight = aux_loss_weight
+            self.patch_aux_decay_start_ratio = float(
+                self.patchwork_guidance_cfg.get('AUX_WEIGHT_DECAY_START_RATIO', 2.0 / 3.0)
+            )
+            self.patch_aux_decay_final_ratio = float(
+                self.patchwork_guidance_cfg.get('AUX_WEIGHT_DECAY_FINAL_RATIO', 0.05)
+            )
+            sigma_xy_scale_by_class = self.patchwork_guidance_cfg.get('GAUSSIAN_SIGMA_XY_SCALE_BY_CLASS', None)
+            sigma_xy_min_by_class = self.patchwork_guidance_cfg.get('GAUSSIAN_SIGMA_XY_MIN_BY_CLASS', None)
+            if sigma_xy_scale_by_class is None or sigma_xy_min_by_class is None:
+                raise ValueError('PATCHWORK_GUIDANCE requires GAUSSIAN_SIGMA_XY_SCALE_BY_CLASS and GAUSSIAN_SIGMA_XY_MIN_BY_CLASS')
+            if len(sigma_xy_scale_by_class) != self.patch_guidance_num_classes:
+                raise ValueError(
+                    f'GAUSSIAN_SIGMA_XY_SCALE_BY_CLASS expects {self.patch_guidance_num_classes} values, got {sigma_xy_scale_by_class}'
+                )
+            if len(sigma_xy_min_by_class) != self.patch_guidance_num_classes:
+                raise ValueError(
+                    f'GAUSSIAN_SIGMA_XY_MIN_BY_CLASS expects {self.patch_guidance_num_classes} values, got {sigma_xy_min_by_class}'
+                )
+            self.register_buffer(
+                'patch_sigma_xy_scale_by_class',
+                torch.tensor(sigma_xy_scale_by_class, dtype=torch.float32)
+            )
+            self.register_buffer(
+                'patch_sigma_xy_min_by_class',
+                torch.tensor(sigma_xy_min_by_class, dtype=torch.float32)
+            )
+            self.patch_sigma_z_scale = float(self.patchwork_guidance_cfg.get('GAUSSIAN_SIGMA_Z_SCALE', 0.25))
+            self.patch_sigma_z_min = float(self.patchwork_guidance_cfg.get('GAUSSIAN_SIGMA_Z_MIN', 0.25))
+            self.patch_guidance_class_names = list(
+                self.patchwork_guidance_cfg.get(
+                    'GUIDANCE_CLASS_NAMES',
+                    ['Car', 'Pedestrian', 'Cyclist'][:self.patch_guidance_num_classes]
+                )
+            )
+            if len(self.patch_guidance_class_names) != self.patch_guidance_num_classes:
+                raise ValueError(
+                    f'GUIDANCE_CLASS_NAMES expects {self.patch_guidance_num_classes} values, got {self.patch_guidance_class_names}'
+                )
+
+            self.patch_topology_embedding = PatchTopologyEmbedding(
+                output_dim=dim,
+                num_zone_embeddings=int(self.patchwork_guidance_cfg.get('ZONE_EMB_SIZE', 8)),
+                num_ring_embeddings=int(self.patchwork_guidance_cfg.get('RING_EMB_SIZE', 16)),
+                num_sector_embeddings=int(self.patchwork_guidance_cfg.get('SECTOR_EMB_SIZE', 128)),
+            )
+            self.patch_token_encoder = GroundEncoder(
+                input_dim=9,
+                hidden_dim=hidden_dim,
+                output_dim=patch_dim,
+                norm_type=norm_type
+            )
+            self.patch_context_encoder = GroundEncoder(
+                input_dim=PATCH_CONTEXT_RAW_DIM,
+                hidden_dim=hidden_dim,
+                output_dim=patch_dim,
+                norm_type=norm_type
+            )
+            self.patch_guidance_pre = nn.Sequential(
+                nn.Linear(self.layer_dim[3] + patch_dim + patch_dim, hidden_dim, bias=True),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            self.patch_guidance_logits = nn.Linear(hidden_dim, self.patch_guidance_num_classes, bias=True)
+            self.patch_guidance_gates = nn.Linear(hidden_dim, self.patch_guidance_num_classes, bias=True)
+            self.patch_guidance_residuals = nn.Linear(
+                hidden_dim, self.patch_guidance_num_classes * self.layer_dim[3], bias=True
+            )
+            self.patch_guidance_residual_scale = nn.Parameter(
+                torch.tensor(float(residual_scale_init), dtype=torch.float32)
+            )
+            nn.init.normal_(self.patch_guidance_logits.weight, mean=0.0, std=weight_std)
+            nn.init.normal_(self.patch_guidance_gates.weight, mean=0.0, std=weight_std)
+            nn.init.normal_(self.patch_guidance_residuals.weight, mean=0.0, std=weight_std)
+            nn.init.constant_(self.patch_guidance_logits.bias, logit_bias_init)
+            nn.init.constant_(self.patch_guidance_gates.bias, gate_bias_init)
+            nn.init.zeros_(self.patch_guidance_residuals.bias)
 
         self.num_point_features = dim
 
@@ -1003,6 +1213,178 @@ class LION3DBackboneOneStride(nn.Module):
 
         return replace_feature(x, modulated)
 
+    def build_patchwork_state(self, batch_dict):
+        if not self.patchwork_guidance_enabled:
+            return None
+        points = batch_dict.get('points', None)
+        patch_infos = batch_dict.get('patch_infos', None)
+        if points is None:
+            raise KeyError('PATCHWORK_GUIDANCE requires batch_dict["points"]')
+        if patch_infos is None:
+            raise KeyError('PATCHWORK_GUIDANCE requires batch_dict["patch_infos"]')
+        return {
+            'points': points,
+            'patch_infos': patch_infos,
+            'tb_dict': {},
+            'global_step': int(batch_dict.get('global_step', 0)),
+        }
+
+    def should_record_patchwork_metrics(self, patchwork_state):
+        if not self.patchwork_guidance_enabled or patchwork_state is None:
+            return False
+        if not self.training:
+            return True
+        return (patchwork_state['global_step'] % self.patchwork_metric_interval) == 0
+
+    def pool_patch_context_raw(self, points, target_coords, target_spatial_shape, stride_xyz):
+        return pool_patch_context_to_sparse_coords(
+            points=points,
+            target_coords=target_coords,
+            target_spatial_shape=target_spatial_shape,
+            voxel_size=self.patch_context_voxel_size,
+            point_cloud_range=self.patch_context_point_cloud_range,
+            stride_xyz=stride_xyz,
+            feature_indices=self.patch_point_feature_indices
+        )
+
+    def encode_patch_topology(self, zone_ids, ring_ids, sector_ids):
+        return self.patch_topology_embedding(zone_ids=zone_ids, ring_ids=ring_ids, sector_ids=sector_ids)
+
+    def build_patch_position_inputs(self, patch_context_raw):
+        if patch_context_raw.shape[0] == 0:
+            return patch_context_raw.new_zeros((0, 2)), patch_context_raw.new_zeros((0, self.layer_dim[0]))
+        pos_context = patch_context_raw[:, 1:3]
+        topology_embed = self.encode_patch_topology(
+            zone_ids=torch.round(patch_context_raw[:, 6]),
+            ring_ids=torch.round(patch_context_raw[:, 7]),
+            sector_ids=torch.round(patch_context_raw[:, 8]),
+        )
+        return pos_context, topology_embed
+
+    def encode_patch_tokens(self, patch_infos):
+        if patch_infos.shape[0] == 0:
+            return patch_infos.new_zeros((0, self.layer_dim[3]))
+
+        continuous = torch.cat([
+            patch_infos[:, 2:5],
+            patch_infos[:, 5:8],
+            patch_infos[:, 8:11],
+        ], dim=1)
+        token = self.patch_token_encoder(continuous)
+        topology = self.encode_patch_topology(
+            zone_ids=torch.round(patch_infos[:, 11]),
+            ring_ids=torch.round(patch_infos[:, 12]),
+            sector_ids=torch.round(patch_infos[:, 13]),
+        )
+        return token + topology
+
+    def gather_patch_tokens_for_voxels(self, voxel_batch_ids, voxel_patch_ids, patch_infos, patch_tokens):
+        gathered = patch_tokens.new_zeros((voxel_patch_ids.shape[0], patch_tokens.shape[1]))
+        matched = torch.zeros(voxel_patch_ids.shape[0], dtype=torch.bool, device=voxel_patch_ids.device)
+        if voxel_patch_ids.numel() == 0 or patch_infos.shape[0] == 0:
+            return gathered, matched
+
+        valid_voxel = voxel_patch_ids >= 0
+        if not bool(valid_voxel.any()):
+            return gathered, matched
+
+        patch_local_ids = torch.round(patch_infos[:, 1]).long()
+        max_patch_id = max(
+            int(patch_local_ids.max().item()) + 2 if patch_local_ids.numel() > 0 else 1,
+            int(voxel_patch_ids[valid_voxel].max().item()) + 2
+        )
+        patch_merge = patch_infos[:, 0].long() * max_patch_id + (patch_local_ids + 1)
+        voxel_merge = voxel_batch_ids.long() * max_patch_id + (voxel_patch_ids.long() + 1)
+
+        sorted_merge, sorted_order = torch.sort(patch_merge)
+        voxel_positions = torch.bucketize(voxel_merge[valid_voxel], sorted_merge)
+        found = (
+            (voxel_positions < sorted_merge.shape[0]) &
+            (sorted_merge[voxel_positions.clamp(max=max(sorted_merge.shape[0] - 1, 0))] == voxel_merge[valid_voxel])
+        )
+        if not bool(found.any()):
+            return gathered, matched
+
+        matched_voxel_idx = valid_voxel.nonzero(as_tuple=False).squeeze(1)[found]
+        matched_patch_idx = sorted_order[voxel_positions[found]]
+        gathered[matched_voxel_idx] = patch_tokens[matched_patch_idx]
+        matched[matched_voxel_idx] = True
+        return gathered, matched
+
+    def apply_patchwork_guidance(self, x, patch_context_raw, voxel_patch_ids, patchwork_state):
+        if not self.patchwork_guidance_enabled:
+            return x
+
+        patch_infos = patchwork_state['patch_infos']
+        patch_tokens = self.encode_patch_tokens(patch_infos)
+        selected_patch_tokens, matched_patch = self.gather_patch_tokens_for_voxels(
+            voxel_batch_ids=x.indices[:, 0],
+            voxel_patch_ids=voxel_patch_ids,
+            patch_infos=patch_infos,
+            patch_tokens=patch_tokens
+        )
+        context_features = self.patch_context_encoder(patch_context_raw)
+        guidance_hidden = self.patch_guidance_pre(
+            torch.cat([x.features, context_features, selected_patch_tokens], dim=1)
+        )
+        guidance_logits = self.patch_guidance_logits(guidance_hidden)
+        guidance_gate = torch.sigmoid(self.patch_guidance_gates(guidance_hidden))
+        guidance_prob = torch.sigmoid(guidance_logits)
+        residual = self.patch_guidance_residuals(guidance_hidden).view(
+            guidance_hidden.shape[0], self.patch_guidance_num_classes, self.layer_dim[3]
+        )
+        class_modulation = guidance_prob * guidance_gate
+        delta = self.patch_guidance_residual_scale * (
+            class_modulation.unsqueeze(-1) * residual
+        ).sum(dim=1)
+        updated = replace_feature(x, x.features + delta)
+
+        self.forward_ret_dict = {
+            'guidance_logits': guidance_logits,
+            'guidance_gate': guidance_gate,
+            'guidance_prob': guidance_prob,
+            'guidance_class_modulation': class_modulation,
+            'guidance_residual_classwise': residual,
+            'guidance_delta': delta,
+            'guidance_base_features': x.features,
+            'guidance_context_features': context_features,
+            'guidance_patch_tokens': selected_patch_tokens,
+            'guidance_matched_patch': matched_patch,
+            'guidance_coords': x.indices,
+            'guidance_patch_context_raw': patch_context_raw,
+            'guidance_patch_ids': voxel_patch_ids,
+            'guidance_patch_infos': patch_infos,
+        }
+
+        if self.should_record_patchwork_metrics(patchwork_state):
+            tb_dict = patchwork_state['tb_dict']
+            tb_dict['patch_guidance/patch_tokens_norm_mean'] = float(
+                patch_tokens.norm(dim=1).mean().detach().item()
+            ) if patch_tokens.numel() > 0 else 0.0
+            tb_dict['patch_guidance/context_norm_mean'] = float(
+                context_features.norm(dim=1).mean().detach().item()
+            ) if context_features.numel() > 0 else 0.0
+            tb_dict['patch_guidance/guidance_prob_mean'] = float(guidance_prob.mean().detach().item())
+            tb_dict['patch_guidance/gate_mean'] = float(guidance_gate.mean().detach().item())
+            tb_dict['patch_guidance/class_modulation_mean'] = float(class_modulation.mean().detach().item())
+            tb_dict['patch_guidance/matched_patch_ratio'] = float(
+                matched_patch.float().mean().detach().item()
+            ) if matched_patch.numel() > 0 else 0.0
+            tb_dict['patch_guidance/patch_dominant_ratio_mean'] = float(
+                patch_context_raw[:, 9].mean().detach().item()
+            ) if patch_context_raw.numel() > 0 else 0.0
+            tb_dict['patch_guidance/delta_rel_l2'] = float(
+                (delta.norm() / x.features.norm().clamp_min(1e-6)).detach().item()
+            ) if x.features.numel() > 0 else 0.0
+            tb_dict['patch_guidance/residual_scale'] = float(self.patch_guidance_residual_scale.detach().item())
+            for class_idx, class_name in enumerate(self.patch_guidance_class_names):
+                class_prefix = f'patch_guidance/{class_name.lower()}'
+                tb_dict[f'{class_prefix}_prob_mean'] = float(guidance_prob[:, class_idx].mean().detach().item())
+                tb_dict[f'{class_prefix}_gate_mean'] = float(guidance_gate[:, class_idx].mean().detach().item())
+                tb_dict[f'{class_prefix}_mod_mean'] = float(class_modulation[:, class_idx].mean().detach().item())
+
+        return updated
+
     def build_ground_guided_prior_context(self, batch_dict):
         if not self.ground_guided_enabled:
             return None
@@ -1021,12 +1403,145 @@ class LION3DBackboneOneStride(nn.Module):
             'resized_prior_cache': {},
         }
 
+    def build_patch_guidance_targets(self, gt_boxes, coords):
+        num_voxels = int(coords.shape[0])
+        if gt_boxes is None or num_voxels == 0:
+            return coords.new_zeros((num_voxels, self.patch_guidance_num_classes), dtype=torch.float32)
+
+        voxel_size = self.patch_context_voxel_size.to(device=coords.device, dtype=torch.float32)
+        point_cloud_range = self.patch_context_point_cloud_range.to(device=coords.device, dtype=torch.float32)
+        stride = torch.tensor(self.output_stride_xyz, device=coords.device, dtype=torch.float32)
+
+        center_x = point_cloud_range[0] + (coords[:, 3].float() + 0.5) * voxel_size[0] * stride[0]
+        center_y = point_cloud_range[1] + (coords[:, 2].float() + 0.5) * voxel_size[1] * stride[1]
+        center_z = point_cloud_range[2] + (coords[:, 1].float() + 0.5) * voxel_size[2] * stride[2]
+        batch_ids = coords[:, 0].long()
+        targets = center_x.new_zeros((num_voxels, self.patch_guidance_num_classes))
+
+        for batch_idx in range(gt_boxes.shape[0]):
+            voxel_mask = batch_ids == batch_idx
+            if not bool(voxel_mask.any()):
+                continue
+
+            cur_boxes = gt_boxes[batch_idx]
+            valid_boxes = (
+                (cur_boxes[:, -1] > 0) &
+                (cur_boxes[:, -1] <= self.patch_guidance_num_classes) &
+                (cur_boxes[:, 3] > 0) &
+                (cur_boxes[:, 4] > 0) &
+                (cur_boxes[:, 5] > 0)
+            )
+            if not bool(valid_boxes.any()):
+                continue
+
+            cur_boxes = cur_boxes[valid_boxes]
+            voxel_x = center_x[voxel_mask].unsqueeze(1)
+            voxel_y = center_y[voxel_mask].unsqueeze(1)
+            voxel_z = center_z[voxel_mask].unsqueeze(1)
+            voxel_targets = targets[voxel_mask]
+
+            for class_idx in range(self.patch_guidance_num_classes):
+                class_mask = torch.round(cur_boxes[:, -1]).long() == (class_idx + 1)
+                if not bool(class_mask.any()):
+                    continue
+                class_boxes = cur_boxes[class_mask]
+                box_x = class_boxes[:, 0].unsqueeze(0)
+                box_y = class_boxes[:, 1].unsqueeze(0)
+                box_bottom_z = (class_boxes[:, 2] - class_boxes[:, 5] * 0.5).unsqueeze(0)
+                sigma_xy = torch.clamp(
+                    self.patch_sigma_xy_scale_by_class[class_idx] *
+                    torch.sqrt((class_boxes[:, 3] * class_boxes[:, 4]).clamp_min(1e-6)),
+                    min=self.patch_sigma_xy_min_by_class[class_idx]
+                ).unsqueeze(0)
+                sigma_z = torch.clamp(
+                    self.patch_sigma_z_scale * class_boxes[:, 5].abs(),
+                    min=self.patch_sigma_z_min
+                ).unsqueeze(0)
+
+                dist_xy_sq = (voxel_x - box_x).square() + (voxel_y - box_y).square()
+                dist_z_sq = (voxel_z - box_bottom_z).square()
+                cur_targets = torch.exp(-0.5 * dist_xy_sq / sigma_xy.square()) * torch.exp(
+                    -0.5 * dist_z_sq / sigma_z.square()
+                )
+                voxel_targets[:, class_idx] = cur_targets.max(dim=1).values
+            targets[voxel_mask] = voxel_targets
+        return targets
+
+    def get_patch_aux_loss_weight(self):
+        if not self.patchwork_guidance_enabled:
+            return 0.0
+        total_epochs = int(self.forward_ret_dict.get('total_epochs', 0))
+        cur_epoch = int(self.forward_ret_dict.get('cur_epoch', -1))
+        if total_epochs <= 0 or cur_epoch < 0:
+            return self.patch_aux_loss_weight
+
+        progress = float(cur_epoch + 1) / float(max(total_epochs, 1))
+        if progress <= self.patch_aux_decay_start_ratio:
+            return self.patch_aux_loss_weight
+
+        tail_denom = max(1.0 - self.patch_aux_decay_start_ratio, 1e-6)
+        tail_progress = min(max((progress - self.patch_aux_decay_start_ratio) / tail_denom, 0.0), 1.0)
+        weight_ratio = 1.0 + (self.patch_aux_decay_final_ratio - 1.0) * tail_progress
+        return self.patch_aux_loss_weight * weight_ratio
+
+    def get_loss(self, tb_dict=None):
+        tb_dict = {} if tb_dict is None else tb_dict
+        if not self.patchwork_guidance_enabled or not self.forward_ret_dict:
+            return None, tb_dict
+
+        guidance_logits = self.forward_ret_dict.get('guidance_logits', None)
+        guidance_coords = self.forward_ret_dict.get('guidance_coords', None)
+        gt_boxes = self.forward_ret_dict.get('gt_boxes', None)
+        if guidance_logits is None or guidance_coords is None or gt_boxes is None:
+            return None, tb_dict
+
+        target = self.build_patch_guidance_targets(gt_boxes=gt_boxes, coords=guidance_coords)
+        raw_loss = F.binary_cross_entropy_with_logits(guidance_logits, target, reduction='mean')
+        aux_weight = self.get_patch_aux_loss_weight()
+        weighted_loss = raw_loss * aux_weight
+
+        guidance_prob = self.forward_ret_dict['guidance_prob']
+        guidance_gate = self.forward_ret_dict['guidance_gate']
+        class_modulation = self.forward_ret_dict['guidance_class_modulation']
+        guidance_delta = self.forward_ret_dict['guidance_delta']
+        base_features = self.forward_ret_dict['guidance_base_features']
+        matched_patch = self.forward_ret_dict['guidance_matched_patch']
+        tb_dict.update({
+            'patch_guidance/loss_aux': raw_loss.item(),
+            'patch_guidance/loss_aux_weighted': weighted_loss.item(),
+            'patch_guidance/target_mean': target.mean().item(),
+            'patch_guidance/aux_weight_active': float(aux_weight),
+            'patch_guidance/fg_prob_mean': guidance_prob[target > 0.1].mean().item() if bool((target > 0.1).any()) else 0.0,
+            'patch_guidance/bg_prob_mean': guidance_prob[target <= 0.01].mean().item() if bool((target <= 0.01).any()) else 0.0,
+            'patch_guidance/gate_mean': guidance_gate.mean().item(),
+            'patch_guidance/class_modulation_mean': class_modulation.mean().item(),
+            'patch_guidance/delta_rel_l2': (
+                guidance_delta.norm() / base_features.norm().clamp_min(1e-6)
+            ).item() if base_features.numel() > 0 else 0.0,
+            'patch_guidance/matched_patch_ratio': matched_patch.float().mean().item() if matched_patch.numel() > 0 else 0.0,
+        })
+        for class_idx, class_name in enumerate(self.patch_guidance_class_names):
+            class_prefix = f'patch_guidance/{class_name.lower()}'
+            class_target = target[:, class_idx]
+            class_prob = guidance_prob[:, class_idx]
+            class_gate = guidance_gate[:, class_idx]
+            class_fg_mask = class_target > 0.1
+            class_bg_mask = class_target <= 0.01
+            tb_dict[f'{class_prefix}_target_mean'] = class_target.mean().item()
+            tb_dict[f'{class_prefix}_fg_prob_mean'] = class_prob[class_fg_mask].mean().item() if bool(class_fg_mask.any()) else 0.0
+            tb_dict[f'{class_prefix}_bg_prob_mean'] = class_prob[class_bg_mask].mean().item() if bool(class_bg_mask.any()) else 0.0
+            tb_dict[f'{class_prefix}_gate_mean'] = class_gate.mean().item()
+            tb_dict[f'{class_prefix}_mod_mean'] = class_modulation[:, class_idx].mean().item()
+        return weighted_loss, tb_dict
+
     def forward(self, batch_dict):
         voxel_features = batch_dict['voxel_features']
         voxel_coords = batch_dict['voxel_coords']
         batch_size = batch_dict['batch_size']
         prior_context = self.build_ground_guided_prior_context(batch_dict)
         ground_context_state = self.build_ground_context_state(batch_dict)
+        patchwork_state = self.build_patchwork_state(batch_dict)
+        self.forward_ret_dict = {}
 
         x = spconv.SparseConvTensor(
             features=voxel_features,
@@ -1035,9 +1550,24 @@ class LION3DBackboneOneStride(nn.Module):
             batch_size=batch_size
         )
 
+        stage0_patch_raw = None
+        stage0_patch_ids = None
+        stage0_patch_pos = None
+        stage0_patch_topology = None
+        if self.patchwork_guidance_enabled:
+            stage0_patch_raw = batch_dict.get('voxel_patch_context_raw', None)
+            stage0_patch_ids = batch_dict.get('voxel_patch_ids', None)
+            if stage0_patch_raw is None or stage0_patch_raw.shape[0] != x.indices.shape[0]:
+                stage0_patch_raw, stage0_patch_ids = self.pool_patch_context_raw(
+                    points=patchwork_state['points'],
+                    target_coords=x.indices,
+                    target_spatial_shape=x.spatial_shape,
+                    stride_xyz=self.stage_strides_xyz[0]
+                )
+            stage0_patch_pos, stage0_patch_topology = self.build_patch_position_inputs(stage0_patch_raw)
         if self.ground_context_enabled:
             stage0_raw = batch_dict.get('voxel_ground_context_raw', None)
-            if stage0_raw is None or stage0_raw.shape[0] != voxel_coords.shape[0]:
+            if stage0_raw is None or stage0_raw.shape[0] != x.indices.shape[0]:
                 stage0_raw = self.pool_ground_context_raw(
                     points=ground_context_state['points'],
                     target_coords=x.indices,
@@ -1045,8 +1575,23 @@ class LION3DBackboneOneStride(nn.Module):
                     stride_xyz=self.stage_strides_xyz[0]
                 )
             x = self.apply_ground_context_film(x, 0, stage0_raw, ground_context_state=ground_context_state)
-        x = self.linear_1(x, prior_context=prior_context)
+        x = self.linear_1(
+            x,
+            prior_context=prior_context,
+            patch_pos_context=stage0_patch_pos,
+            patch_topology_embed=stage0_patch_topology
+        )
         x1, _ = self.dow1(x, prior_context=prior_context)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
+        stage1_patch_pos = None
+        stage1_patch_topology = None
+        if self.patchwork_guidance_enabled:
+            stage1_patch_raw, _ = self.pool_patch_context_raw(
+                points=patchwork_state['points'],
+                target_coords=x1.indices,
+                target_spatial_shape=x1.spatial_shape,
+                stride_xyz=self.stage_strides_xyz[1]
+            )
+            stage1_patch_pos, stage1_patch_topology = self.build_patch_position_inputs(stage1_patch_raw)
         if self.ground_context_enabled:
             stage1_raw = self.pool_ground_context_raw(
                 points=ground_context_state['points'],
@@ -1055,8 +1600,23 @@ class LION3DBackboneOneStride(nn.Module):
                 stride_xyz=self.stage_strides_xyz[1]
             )
             x1 = self.apply_ground_context_film(x1, 1, stage1_raw, ground_context_state=ground_context_state)
-        x = self.linear_2(x1, prior_context=prior_context)
+        x = self.linear_2(
+            x1,
+            prior_context=prior_context,
+            patch_pos_context=stage1_patch_pos,
+            patch_topology_embed=stage1_patch_topology
+        )
         x2, _ = self.dow2(x, prior_context=prior_context)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
+        stage2_patch_pos = None
+        stage2_patch_topology = None
+        if self.patchwork_guidance_enabled:
+            stage2_patch_raw, _ = self.pool_patch_context_raw(
+                points=patchwork_state['points'],
+                target_coords=x2.indices,
+                target_spatial_shape=x2.spatial_shape,
+                stride_xyz=self.stage_strides_xyz[2]
+            )
+            stage2_patch_pos, stage2_patch_topology = self.build_patch_position_inputs(stage2_patch_raw)
         if self.ground_context_enabled:
             stage2_raw = self.pool_ground_context_raw(
                 points=ground_context_state['points'],
@@ -1065,8 +1625,23 @@ class LION3DBackboneOneStride(nn.Module):
                 stride_xyz=self.stage_strides_xyz[2]
             )
             x2 = self.apply_ground_context_film(x2, 2, stage2_raw, ground_context_state=ground_context_state)
-        x = self.linear_3(x2, prior_context=prior_context)
+        x = self.linear_3(
+            x2,
+            prior_context=prior_context,
+            patch_pos_context=stage2_patch_pos,
+            patch_topology_embed=stage2_patch_topology
+        )
         x3, _ = self.dow3(x, prior_context=prior_context)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
+        stage3_patch_pos = None
+        stage3_patch_topology = None
+        if self.patchwork_guidance_enabled:
+            stage3_patch_raw, _ = self.pool_patch_context_raw(
+                points=patchwork_state['points'],
+                target_coords=x3.indices,
+                target_spatial_shape=x3.spatial_shape,
+                stride_xyz=self.stage_strides_xyz[3]
+            )
+            stage3_patch_pos, stage3_patch_topology = self.build_patch_position_inputs(stage3_patch_raw)
         if self.ground_context_enabled:
             stage3_raw = self.pool_ground_context_raw(
                 points=ground_context_state['points'],
@@ -1075,9 +1650,30 @@ class LION3DBackboneOneStride(nn.Module):
                 stride_xyz=self.stage_strides_xyz[3]
             )
             x3 = self.apply_ground_context_film(x3, 3, stage3_raw, ground_context_state=ground_context_state)
-        x = self.linear_4(x3, prior_context=prior_context)
+        x = self.linear_4(
+            x3,
+            prior_context=prior_context,
+            patch_pos_context=stage3_patch_pos,
+            patch_topology_embed=stage3_patch_topology
+        )
         x4, _ = self.dow4(x, prior_context=prior_context)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
         x = self.linear_out(x4)
+        if self.patchwork_guidance_enabled:
+            guidance_patch_context_raw, guidance_patch_ids = self.pool_patch_context_raw(
+                points=patchwork_state['points'],
+                target_coords=x.indices,
+                target_spatial_shape=x.spatial_shape,
+                stride_xyz=self.output_stride_xyz
+            )
+            x = self.apply_patchwork_guidance(
+                x=x,
+                patch_context_raw=guidance_patch_context_raw,
+                voxel_patch_ids=guidance_patch_ids,
+                patchwork_state=patchwork_state
+            )
+            self.forward_ret_dict['gt_boxes'] = batch_dict.get('gt_boxes', None)
+            self.forward_ret_dict['cur_epoch'] = int(batch_dict.get('cur_epoch', -1))
+            self.forward_ret_dict['total_epochs'] = int(batch_dict.get('total_epochs', 0))
 
         batch_dict.update({
             'encoded_spconv_tensor': x,
@@ -1104,6 +1700,8 @@ class LION3DBackboneOneStride(nn.Module):
             batch_dict['ground_guided_tb_dict'] = prior_context['tb_dict']
         if ground_context_state is not None and ground_context_state['tb_dict']:
             batch_dict['ground_context_tb_dict'] = ground_context_state['tb_dict']
+        if patchwork_state is not None and patchwork_state['tb_dict']:
+            batch_dict['patchwork_tb_dict'] = patchwork_state['tb_dict']
 
         return batch_dict
 
