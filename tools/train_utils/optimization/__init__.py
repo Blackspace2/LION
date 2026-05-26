@@ -71,6 +71,8 @@ def build_optimizer(model, optim_cfg):
 
 def build_scheduler(optimizer, total_iters_each_epoch, total_epochs, last_epoch, optim_cfg):
     decay_steps = [x * total_iters_each_epoch for x in optim_cfg.DECAY_STEP_LIST]
+    scheduler_type = getattr(optim_cfg, 'SCHEDULER', '')
+
     def lr_lbmd(cur_epoch):
         cur_decay = 1
         for decay_step in decay_steps:
@@ -78,11 +80,23 @@ def build_scheduler(optimizer, total_iters_each_epoch, total_epochs, last_epoch,
                 cur_decay = cur_decay * optim_cfg.LR_DECAY
         return max(cur_decay, optim_cfg.LR_CLIP / optim_cfg.LR)
 
+    def constant_lr(_):
+        return 1.0
+
     lr_warmup_scheduler = None
     total_steps = total_iters_each_epoch * total_epochs
     if optim_cfg.OPTIMIZER == 'adam_onecycle':
         lr_scheduler = OneCycle(
             optimizer, total_steps, optim_cfg.LR, list(optim_cfg.MOMS), optim_cfg.DIV_FACTOR, optim_cfg.PCT_START
+        )
+    elif scheduler_type in ['constant', 'none']:
+        lr_scheduler = lr_sched.LambdaLR(optimizer, constant_lr, last_epoch=last_epoch)
+    elif scheduler_type == 'cosine':
+        lr_scheduler = lr_sched.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=optim_cfg.LR_CLIP,
+            last_epoch=last_epoch,
         )
     else:
         lr_scheduler = lr_sched.LambdaLR(optimizer, lr_lbmd, last_epoch=last_epoch)
