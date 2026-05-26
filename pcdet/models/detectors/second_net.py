@@ -28,19 +28,20 @@ class SECONDNet(Detector3DTemplate):
         disp_dict = {}
 
         loss_rpn, tb_dict = self.dense_head.get_loss()
-        tb_dict = {
-            'loss_rpn': loss_rpn.item(),
-            **tb_dict
-        }
         tb_dict.update(self.forward_ret_dict.get('ground_guided_tb_dict', {}))
         tb_dict.update(self.forward_ret_dict.get('ground_context_tb_dict', {}))
+        tb_dict.update(self.forward_ret_dict.get('patchwork_tb_dict', {}))
         loss = loss_rpn
+
+        if hasattr(self.backbone_3d, 'get_loss'):
+            loss_backbone_3d, tb_dict = self.backbone_3d.get_loss(tb_dict)
+            if loss_backbone_3d is not None:
+                loss = loss + loss_backbone_3d
 
         if hasattr(self, 'map_to_bev_module') and hasattr(self.map_to_bev_module, 'get_loss'):
             loss_ground_defect, ground_defect_tb = self.map_to_bev_module.get_loss()
             if loss_ground_defect is not None:
                 loss = loss + loss_ground_defect
                 tb_dict.update(ground_defect_tb)
-                tb_dict['loss_total'] = loss.item()
 
         return loss, tb_dict, disp_dict
