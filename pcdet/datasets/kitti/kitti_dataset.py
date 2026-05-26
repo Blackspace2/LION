@@ -78,15 +78,51 @@ class KittiDataset(DatasetTemplate):
         self.ground_context_film_enabled = self.ground_prior_enabled and self.ground_prior_cfg.get(
             'GROUND_CONTEXT_FILM_ENABLED', False
         )
-        if self.ground_defect_guidance_enabled and self.ground_context_film_enabled:
-            raise ValueError('GROUND_DEFECT_GUIDANCE_ENABLED and GROUND_CONTEXT_FILM_ENABLED cannot both be True')
-        self.custom_ground_feature_enabled = self.ground_defect_guidance_enabled or self.ground_context_film_enabled
+        self.bev_occupancy_guidance_enabled = self.ground_prior_enabled and self.ground_prior_cfg.get(
+            'BEV_OCCUPANCY_GUIDANCE_ENABLED', False
+        )
+        self.patchwork_guidance_enabled = self.ground_prior_enabled and self.ground_prior_cfg.get(
+            'PATCHWORK_GUIDANCE_ENABLED', False
+        )
+        enabled_modes = sum([
+            int(self.ground_defect_guidance_enabled),
+            int(self.ground_context_film_enabled),
+            int(self.bev_occupancy_guidance_enabled),
+            int(self.patchwork_guidance_enabled),
+        ])
+        if enabled_modes > 1:
+            raise ValueError(
+                'GROUND_DEFECT_GUIDANCE_ENABLED, GROUND_CONTEXT_FILM_ENABLED, '
+                'BEV_OCCUPANCY_GUIDANCE_ENABLED, and PATCHWORK_GUIDANCE_ENABLED '
+                'cannot enable more than one at the same time'
+            )
+        self.custom_ground_feature_enabled = (
+            self.ground_defect_guidance_enabled or
+            self.ground_context_film_enabled or
+            self.bev_occupancy_guidance_enabled or
+            self.patchwork_guidance_enabled
+        )
         self.legacy_ground_prior_enabled = (
             self.ground_prior_enabled and
             not self.ground_defect_guidance_enabled and
-            not self.ground_context_film_enabled
+            not self.ground_context_film_enabled and
+            not self.bev_occupancy_guidance_enabled and
+            not self.patchwork_guidance_enabled
         )
-        if self.ground_context_film_enabled:
+        if self.patchwork_guidance_enabled or self.bev_occupancy_guidance_enabled:
+            self.point_feature_names = (
+                'is_ground',
+                'patch_center_z',
+                'patch_normal_z',
+                'patch_flatness',
+                'patch_elevation',
+                'patch_point_count',
+                'patch_zone_id',
+                'patch_ring_id',
+                'patch_sector_id',
+                'point_patch_id',
+            )
+        elif self.ground_context_film_enabled:
             self.point_feature_names = (
                 'is_ground',
                 'delta_z_to_ground',
@@ -187,17 +223,29 @@ class KittiDataset(DatasetTemplate):
         if self._ground_segmenter is not None:
             return self._ground_segmenter
 
-        try:
-            import linefit_bind
-        except ImportError as exc:
-            raise ImportError('GROUND_PRIOR enabled but linefit_bind is not available') from exc
+        if self.patchwork_guidance_enabled or self.bev_occupancy_guidance_enabled:
+            try:
+                import pypatchworkpp
+            except ImportError as exc:
+                raise ImportError(
+                    'PATCHWORK_GUIDANCE_ENABLED or BEV_OCCUPANCY_GUIDANCE_ENABLED but pypatchworkpp is not available'
+                ) from exc
 
-        config_path = self.ground_prior_cfg.get('LINEFIT_CONFIG', None)
-        with self.suppress_native_stdio():
-            if config_path is not None:
-                self._ground_segmenter = linefit_bind.ground_seg(str(Path(config_path).expanduser()))
-            else:
-                self._ground_segmenter = linefit_bind.ground_seg()
+            params = pypatchworkpp.Parameters()
+            with self.suppress_native_stdio():
+                self._ground_segmenter = pypatchworkpp.patchworkpp(params)
+        else:
+            try:
+                import linefit_bind
+            except ImportError as exc:
+                raise ImportError('GROUND_PRIOR enabled but linefit_bind is not available') from exc
+
+            config_path = self.ground_prior_cfg.get('LINEFIT_CONFIG', None)
+            with self.suppress_native_stdio():
+                if config_path is not None:
+                    self._ground_segmenter = linefit_bind.ground_seg(str(Path(config_path).expanduser()))
+                else:
+                    self._ground_segmenter = linefit_bind.ground_seg()
         return self._ground_segmenter
 
     def infer_ground_point_labels(self, points):
@@ -212,6 +260,67 @@ class KittiDataset(DatasetTemplate):
                 f'linefit returned mismatched labels: {labels.shape[0]} vs points {points.shape[0]}'
             )
         return labels.astype(np.float32)
+
+    def infer_patchwork_outputs(self, points):
+        if points.shape[0] == 0:
+            return {
+                'point_ground_mask': np.zeros((0,), dtype=np.float32),
+                'point_patch_id': np.zeros((0,), dtype=np.int32),
+                'patch_infos': np.zeros((0, 13), dtype=np.float32),
+            }
+
+        ground_segmenter = self.get_ground_segmenter()
+        with self.suppress_native_stdio():
+            ground_segmenter.estimateGround(points[:, :4])
+
+        point_ground_mask = np.asarray(ground_segmenter.getPointGroundMask(), dtype=np.float32)
+        point_patch_id = np.asarray(ground_segmenter.getPointPatchIds(), dtype=np.int32)
+        patch_centers = np.asarray(ground_segmenter.getCenters(), dtype=np.float32)
+        patch_normals = np.asarray(ground_segmenter.getNormals(), dtype=np.float32)
+        patch_flatness = np.asarray(ground_segmenter.getPatchFlatness(), dtype=np.float32).reshape(-1, 1)
+        patch_elevation = np.asarray(ground_segmenter.getPatchElevation(), dtype=np.float32).reshape(-1, 1)
+        patch_point_count = np.asarray(ground_segmenter.getPatchPointCount(), dtype=np.float32).reshape(-1, 1)
+        patch_zone_id = np.asarray(ground_segmenter.getPatchZoneIds(), dtype=np.float32).reshape(-1, 1)
+        patch_ring_id = np.asarray(ground_segmenter.getPatchRingIds(), dtype=np.float32).reshape(-1, 1)
+        patch_sector_id = np.asarray(ground_segmenter.getPatchSectorIds(), dtype=np.float32).reshape(-1, 1)
+
+        if point_ground_mask.shape[0] != points.shape[0]:
+            raise RuntimeError(
+                f'Patchwork++ returned mismatched ground mask: {point_ground_mask.shape[0]} vs {points.shape[0]}'
+            )
+        if point_patch_id.shape[0] != points.shape[0]:
+            raise RuntimeError(
+                f'Patchwork++ returned mismatched patch ids: {point_patch_id.shape[0]} vs {points.shape[0]}'
+            )
+        patch_count = patch_centers.shape[0]
+        if patch_count != patch_normals.shape[0]:
+            raise RuntimeError(
+                f'Patchwork++ patch center/normal count mismatch: {patch_count} vs {patch_normals.shape[0]}'
+            )
+        if patch_count == 0:
+            patch_infos = np.zeros((0, 13), dtype=np.float32)
+        else:
+            patch_ids = np.arange(patch_count, dtype=np.float32).reshape(-1, 1)
+            patch_infos = np.concatenate(
+                [
+                    patch_ids,
+                    patch_centers.astype(np.float32),
+                    patch_normals.astype(np.float32),
+                    patch_flatness,
+                    patch_elevation,
+                    patch_point_count,
+                    patch_zone_id,
+                    patch_ring_id,
+                    patch_sector_id,
+                ],
+                axis=1
+            )
+
+        return {
+            'point_ground_mask': point_ground_mask,
+            'point_patch_id': point_patch_id,
+            'patch_infos': patch_infos.astype(np.float32),
+        }
 
     def build_ground_prior_cell_stats(self, points, point_ground_labels):
         if point_ground_labels is None:
@@ -474,6 +583,69 @@ class KittiDataset(DatasetTemplate):
         data_dict['ground_point_feature_indices'] = ground_feature_indices
         return data_dict
 
+    def attach_patchworkpp_point_features(self, data_dict):
+        if data_dict.get('patch_infos', None) is not None:
+            return data_dict
+
+        points = data_dict.get('points', None)
+        if points is None:
+            return data_dict
+
+        patch_outputs = self.infer_patchwork_outputs(points)
+        point_ground_mask = patch_outputs['point_ground_mask']
+        point_patch_id = patch_outputs['point_patch_id']
+        patch_infos = patch_outputs['patch_infos']
+
+        num_points = points.shape[0]
+        patch_center_z = np.zeros(num_points, dtype=np.float32)
+        patch_normal_z = np.zeros(num_points, dtype=np.float32)
+        patch_flatness = np.zeros(num_points, dtype=np.float32)
+        patch_elevation = np.zeros(num_points, dtype=np.float32)
+        patch_point_count = np.zeros(num_points, dtype=np.float32)
+        patch_zone_id = np.full(num_points, -1.0, dtype=np.float32)
+        patch_ring_id = np.full(num_points, -1.0, dtype=np.float32)
+        patch_sector_id = np.full(num_points, -1.0, dtype=np.float32)
+
+        valid_patch = (
+            point_patch_id >= 0
+        ) & (
+            point_patch_id < patch_infos.shape[0]
+        )
+        if np.any(valid_patch):
+            point_patch_id_valid = point_patch_id[valid_patch]
+            patch_center_z[valid_patch] = patch_infos[point_patch_id_valid, 3]
+            patch_normal_z[valid_patch] = patch_infos[point_patch_id_valid, 6]
+            patch_flatness[valid_patch] = patch_infos[point_patch_id_valid, 7]
+            patch_elevation[valid_patch] = patch_infos[point_patch_id_valid, 8]
+            patch_point_count[valid_patch] = patch_infos[point_patch_id_valid, 9]
+            patch_zone_id[valid_patch] = patch_infos[point_patch_id_valid, 10]
+            patch_ring_id[valid_patch] = patch_infos[point_patch_id_valid, 11]
+            patch_sector_id[valid_patch] = patch_infos[point_patch_id_valid, 12]
+
+        appended_features = np.stack(
+            [
+                point_ground_mask.astype(np.float32),
+                patch_center_z,
+                patch_normal_z,
+                patch_flatness,
+                patch_elevation,
+                patch_point_count,
+                patch_zone_id,
+                patch_ring_id,
+                patch_sector_id,
+                point_patch_id.astype(np.float32),
+            ],
+            axis=1
+        )
+        data_dict['points'] = np.concatenate([points, appended_features], axis=1)
+        data_dict['patch_infos'] = patch_infos.astype(np.float32)
+        return data_dict
+
+    def attach_custom_ground_features(self, data_dict):
+        if self.patchwork_guidance_enabled or self.bev_occupancy_guidance_enabled:
+            return self.attach_patchworkpp_point_features(data_dict)
+        return self.attach_ground_point_features(data_dict)
+
     def build_object_footprint_mask(self, gt_boxes):
         map_h = int(self.grid_size[1])
         map_w = int(self.grid_size[0])
@@ -503,6 +675,178 @@ class KittiDataset(DatasetTemplate):
             footprint_mask[in_box] = 1.0
 
         return footprint_mask
+
+    def build_class_footprint_masks(self, gt_boxes):
+        map_h = int(self.grid_size[1])
+        map_w = int(self.grid_size[0])
+        class_masks = np.zeros((len(self.class_names), map_h, map_w), dtype=np.float32)
+        if gt_boxes is None or gt_boxes.shape[0] == 0 or gt_boxes.shape[1] < 8:
+            return class_masks
+
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        pc_range_min = self.point_cloud_range[:3]
+        x_centers = pc_range_min[0] + (np.arange(map_w, dtype=np.float32) + 0.5) * voxel_size[0]
+        y_centers = pc_range_min[1] + (np.arange(map_h, dtype=np.float32) + 0.5) * voxel_size[1]
+        grid_x, grid_y = np.meshgrid(x_centers, y_centers)
+
+        for box in gt_boxes:
+            class_idx = int(round(float(box[7]))) - 1
+            if class_idx < 0 or class_idx >= len(self.class_names):
+                continue
+
+            dx = float(box[3]) * 0.5
+            dy = float(box[4]) * 0.5
+            if dx <= 0 or dy <= 0:
+                continue
+
+            rel_x = grid_x - float(box[0])
+            rel_y = grid_y - float(box[1])
+            cos_heading = float(np.cos(box[6]))
+            sin_heading = float(np.sin(box[6]))
+            local_x = rel_x * cos_heading + rel_y * sin_heading
+            local_y = -rel_x * sin_heading + rel_y * cos_heading
+            in_box = (np.abs(local_x) <= dx) & (np.abs(local_y) <= dy)
+            class_masks[class_idx, in_box] = 1.0
+
+        return class_masks
+
+    def build_patch_bev_context_maps(self, data_dict):
+        map_h = int(self.grid_size[1])
+        map_w = int(self.grid_size[0])
+        context_map = np.zeros((5, map_h, map_w), dtype=np.float32)
+        valid_mask = np.zeros((map_h, map_w), dtype=np.float32)
+
+        points = data_dict.get('points', None)
+        if points is None or points.shape[0] == 0:
+            return context_map, valid_mask
+
+        feature_offset = 4
+        feature_names = {name: feature_offset + idx for idx, name in enumerate(self.point_feature_names)}
+        mask = common_utils.mask_points_by_range_v2(points[:, :3], self.point_cloud_range)
+        if not np.any(mask):
+            return context_map, valid_mask
+
+        points_in_range = points[mask]
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        pc_range_min = self.point_cloud_range[:3]
+        x_idx = np.floor((points_in_range[:, 0] - pc_range_min[0]) / voxel_size[0]).astype(np.int32)
+        y_idx = np.floor((points_in_range[:, 1] - pc_range_min[1]) / voxel_size[1]).astype(np.int32)
+        valid = (
+            (x_idx >= 0) & (x_idx < map_w) &
+            (y_idx >= 0) & (y_idx < map_h)
+        )
+        if not np.any(valid):
+            return context_map, valid_mask
+
+        points_in_range = points_in_range[valid]
+        x_idx = x_idx[valid]
+        y_idx = y_idx[valid]
+
+        total_counts = np.zeros((map_h, map_w), dtype=np.float32)
+        ground_counts = np.zeros((map_h, map_w), dtype=np.float32)
+        center_z_sum = np.zeros((map_h, map_w), dtype=np.float32)
+        normal_z_sum = np.zeros((map_h, map_w), dtype=np.float32)
+        flatness_sum = np.zeros((map_h, map_w), dtype=np.float32)
+        elevation_sum = np.zeros((map_h, map_w), dtype=np.float32)
+
+        np.add.at(total_counts, (y_idx, x_idx), 1.0)
+        np.add.at(ground_counts, (y_idx, x_idx), points_in_range[:, feature_names['is_ground']])
+        np.add.at(center_z_sum, (y_idx, x_idx), points_in_range[:, feature_names['patch_center_z']])
+        np.add.at(normal_z_sum, (y_idx, x_idx), points_in_range[:, feature_names['patch_normal_z']])
+        np.add.at(flatness_sum, (y_idx, x_idx), points_in_range[:, feature_names['patch_flatness']])
+        np.add.at(elevation_sum, (y_idx, x_idx), points_in_range[:, feature_names['patch_elevation']])
+
+        valid_cells = total_counts > 0
+        valid_mask[valid_cells] = 1.0
+        denom = np.clip(total_counts, a_min=1.0, a_max=None)
+
+        ground_ratio_map = ground_counts / denom
+        center_z_map = center_z_sum / denom
+        normal_z_map = normal_z_sum / denom
+        flatness_map = flatness_sum / denom
+        elevation_map = elevation_sum / denom
+
+        center_z_norm = float(self.ground_prior_cfg.get('PATCH_CENTER_Z_NORM', 3.0))
+        elevation_norm = float(self.ground_prior_cfg.get('PATCH_ELEVATION_NORM', 3.0))
+        flatness_norm = float(self.ground_prior_cfg.get('PATCH_FLATNESS_NORM', 1.0))
+        if center_z_norm > 0:
+            center_z_map = np.clip(center_z_map / center_z_norm, -1.0, 1.0)
+        normal_z_map = np.clip(normal_z_map, -1.0, 1.0)
+        if flatness_norm > 0:
+            flatness_map = np.clip(flatness_map / flatness_norm, 0.0, 1.0)
+        if elevation_norm > 0:
+            elevation_map = np.clip(elevation_map / elevation_norm, -1.0, 1.0)
+
+        context_map = np.stack(
+            [ground_ratio_map, center_z_map, normal_z_map, flatness_map, elevation_map],
+            axis=0
+        ).astype(np.float32)
+        return context_map, valid_mask
+
+    def build_soft_occupancy_supervision(self, gt_boxes):
+        map_h = int(self.grid_size[1])
+        map_w = int(self.grid_size[0])
+        occupancy_target = np.zeros((map_h, map_w), dtype=np.float32)
+        occupancy_weight = np.zeros((map_h, map_w), dtype=np.float32)
+        if gt_boxes is None or gt_boxes.shape[0] == 0:
+            return occupancy_target, occupancy_weight
+
+        voxel_size = np.asarray(self.voxel_size, dtype=np.float32)
+        pc_range_min = self.point_cloud_range[:3]
+        x_centers = pc_range_min[0] + (np.arange(map_w, dtype=np.float32) + 0.5) * voxel_size[0]
+        y_centers = pc_range_min[1] + (np.arange(map_h, dtype=np.float32) + 0.5) * voxel_size[1]
+        grid_x, grid_y = np.meshgrid(x_centers, y_centers)
+
+        softness_ratio = float(self.ground_prior_cfg.get('SOFT_OCCUPANCY_EDGE_RATIO', 0.15))
+        min_softness_cells = float(self.ground_prior_cfg.get('SOFT_OCCUPANCY_MIN_EDGE_CELLS', 1.0))
+        min_target_value = float(self.ground_prior_cfg.get('SOFT_OCCUPANCY_MIN_TARGET_VALUE', 1e-4))
+        min_softness_x = voxel_size[0] * min_softness_cells
+        min_softness_y = voxel_size[1] * min_softness_cells
+
+        for box in gt_boxes[:, :7]:
+            half_dx = float(box[3]) * 0.5
+            half_dy = float(box[4]) * 0.5
+            if half_dx <= 0 or half_dy <= 0:
+                continue
+
+            rel_x = grid_x - float(box[0])
+            rel_y = grid_y - float(box[1])
+            cos_heading = float(np.cos(box[6]))
+            sin_heading = float(np.sin(box[6]))
+            local_x = rel_x * cos_heading + rel_y * sin_heading
+            local_y = -rel_x * sin_heading + rel_y * cos_heading
+
+            softness_x = max(half_dx * softness_ratio, min_softness_x)
+            softness_y = max(half_dy * softness_ratio, min_softness_y)
+            soft_x_arg = np.clip((np.abs(local_x) - half_dx) / max(softness_x, 1e-6), -60.0, 60.0)
+            soft_y_arg = np.clip((np.abs(local_y) - half_dy) / max(softness_y, 1e-6), -60.0, 60.0)
+            soft_x = 1.0 / (1.0 + np.exp(soft_x_arg))
+            soft_y = 1.0 / (1.0 + np.exp(soft_y_arg))
+            occupancy = (soft_x * soft_y).astype(np.float32)
+            occupancy[occupancy < min_target_value] = 0.0
+
+            occupancy_sum = float(occupancy.sum())
+            if occupancy_sum <= 0:
+                continue
+            occupancy_target = np.maximum(occupancy_target, occupancy)
+            occupancy_weight = occupancy_weight + (occupancy / occupancy_sum)
+
+        return occupancy_target.astype(np.float32), occupancy_weight.astype(np.float32)
+
+    def build_bev_occupancy_guidance_supervision(self, data_dict):
+        if not self.bev_occupancy_guidance_enabled or data_dict.get('points', None) is None:
+            return data_dict
+
+        context_map, valid_mask = self.build_patch_bev_context_maps(data_dict)
+        data_dict['bev_occupancy_context_map'] = context_map.astype(np.float32)
+        data_dict['bev_occupancy_context_valid_mask'] = valid_mask.astype(np.float32)
+
+        gt_boxes = data_dict.get('gt_boxes', None)
+        occupancy_target, occupancy_weight = self.build_soft_occupancy_supervision(gt_boxes)
+        data_dict['bev_occupancy_target_map'] = occupancy_target.astype(np.float32)
+        data_dict['bev_occupancy_positive_weight_map'] = occupancy_weight.astype(np.float32)
+        data_dict['bev_occupancy_class_mask'] = self.build_class_footprint_masks(gt_boxes).astype(np.float32)
+        return data_dict
 
     def build_ground_defect_supervision(self, data_dict):
         if not self.ground_defect_guidance_enabled or data_dict.get('points', None) is None:
@@ -634,7 +978,7 @@ class KittiDataset(DatasetTemplate):
         )
 
         if self.custom_ground_feature_enabled and not has_gt_sampler:
-            augmentor_dict = self.attach_ground_point_features(augmentor_dict)
+            augmentor_dict = self.attach_custom_ground_features(augmentor_dict)
             ground_features_attached = True
 
         for cur_augmentor in self.data_augmentor.data_augmentor_queue:
@@ -644,11 +988,11 @@ class KittiDataset(DatasetTemplate):
                 not ground_features_attached and
                 isinstance(cur_augmentor, database_sampler.DataBaseSampler)
             ):
-                augmentor_dict = self.attach_ground_point_features(augmentor_dict)
+                augmentor_dict = self.attach_custom_ground_features(augmentor_dict)
                 ground_features_attached = True
 
         if self.custom_ground_feature_enabled and not ground_features_attached:
-            augmentor_dict = self.attach_ground_point_features(augmentor_dict)
+            augmentor_dict = self.attach_custom_ground_features(augmentor_dict)
 
         augmentor_dict['gt_boxes'][:, 6] = common_utils.limit_period(
             augmentor_dict['gt_boxes'][:, 6], offset=0.5, period=2 * np.pi
@@ -675,7 +1019,7 @@ class KittiDataset(DatasetTemplate):
             if calib is not None:
                 data_dict['calib'] = calib
         elif data_dict.get('points', None) is not None:
-            data_dict = self.attach_ground_point_features(data_dict)
+            data_dict = self.attach_custom_ground_features(data_dict)
 
         if data_dict.get('gt_boxes', None) is not None:
             selected = common_utils.keep_arrays_by_name(data_dict['gt_names'], self.class_names)
@@ -689,6 +1033,8 @@ class KittiDataset(DatasetTemplate):
 
         if self.ground_defect_guidance_enabled:
             data_dict = self.build_ground_defect_supervision(data_dict)
+        if self.bev_occupancy_guidance_enabled:
+            data_dict = self.build_bev_occupancy_guidance_supervision(data_dict)
 
         if data_dict.get('points', None) is not None:
             data_dict = self.point_feature_encoder.forward(data_dict)
