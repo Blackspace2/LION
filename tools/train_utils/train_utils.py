@@ -17,6 +17,38 @@ except:
     pass
 
 
+class ModelEMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = float(decay)
+        self.shadow = {
+            name: tensor.detach().clone()
+            for name, tensor in self._state_dict(model).items()
+        }
+
+    @staticmethod
+    def _state_dict(model):
+        module = model.module if hasattr(model, 'module') else model
+        return module.state_dict()
+
+    @torch.no_grad()
+    def update(self, model):
+        model_state = self._state_dict(model)
+        for name, tensor in model_state.items():
+            if name not in self.shadow:
+                self.shadow[name] = tensor.detach().clone()
+                continue
+            if torch.is_floating_point(tensor):
+                self.shadow[name].mul_(self.decay).add_(tensor.detach(), alpha=1.0 - self.decay)
+            else:
+                self.shadow[name].copy_(tensor.detach())
+
+    def state_dict(self):
+        return {
+            name: tensor.detach().clone()
+            for name, tensor in self.shadow.items()
+        }
+
+
 
 def _set_frozen_batchnorm_eval(model):
     module = model.module if hasattr(model, 'module') else model
@@ -148,7 +180,8 @@ def _collect_named_grad_norms(model):
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False,
                     use_logger_to_record=False, logger=None, logger_iter_interval=50, cur_epoch=None,
-                    total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300, show_gpu_stat=False, fp16=False):
+                    total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300, show_gpu_stat=False, fp16=False,
+                    model_ema=None):
     if total_it_each_epoch == len(train_loader):
         dataloader_iter = iter(train_loader)
 
@@ -203,6 +236,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         optimizer.zero_grad()
 
         skipped_nonfinite = False
+        did_optimizer_step = False
         total_norm = torch.zeros((), device='cuda' if torch.cuda.is_available() else 'cpu')
         bn_running_snapshot = _snapshot_bn_running_buffers(model)
         with amp_ctx:
@@ -248,6 +282,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 if torch.isfinite(total_norm):
                     scaler.step(optimizer)
                     scaler.update()
+                    did_optimizer_step = True
                 else:
                     skipped_nonfinite = True
                     optimizer.zero_grad()
@@ -263,6 +298,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 tb_dict.update(_collect_named_grad_norms(model))
                 if torch.isfinite(total_norm):
                     optimizer.step()
+                    did_optimizer_step = True
                 else:
                     skipped_nonfinite = True
                     optimizer.zero_grad()
@@ -273,6 +309,8 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                         )
 
         accumulated_iter += 1
+        if did_optimizer_step and model_ema is not None:
+            model_ema.update(model)
         # assert not torch.isnan(loss)
         if skipped_nonfinite:
             consecutive_nonfinite_skips += 1
@@ -381,7 +419,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 start_epoch, total_epochs, stop_epoch, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False,
-                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, fp16=False, cfg=None):
+                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None,
+                show_gpu_stat=False, fp16=False, cfg=None, model_ema=None, save_ema_as_model=False):
     accumulated_iter = start_iter
 
     augment_disable_flag = False
@@ -437,7 +476,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 logger=logger, logger_iter_interval=logger_iter_interval,
                 ckpt_save_dir=ckpt_save_dir, ckpt_save_time_interval=ckpt_save_time_interval,
                 show_gpu_stat=show_gpu_stat,
-                fp16=fp16
+                fp16=fp16,
+                model_ema=model_ema
             )
 
             # save trained model
@@ -455,6 +495,22 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 save_checkpoint(
                     checkpoint_state(model, optimizer, trained_epoch, accumulated_iter), filename=ckpt_name,
                 )
+                if model_ema is not None:
+                    ema_ckpt_name = ckpt_save_dir / ('checkpoint_epoch_%d_ema' % trained_epoch)
+                    save_checkpoint(
+                        checkpoint_state(
+                            model,
+                            optimizer,
+                            trained_epoch,
+                            accumulated_iter,
+                            model_state_override=model_ema.state_dict()
+                        ),
+                        filename=ema_ckpt_name,
+                    )
+                    if save_ema_as_model:
+                        raw_ckpt_name = ckpt_save_dir / ('raw_checkpoint_epoch_%d' % trained_epoch)
+                        os.replace(str(ckpt_name) + '.pth', str(raw_ckpt_name) + '.pth')
+                        os.replace(str(ema_ckpt_name) + '.pth', str(ckpt_name) + '.pth')
 
 
 def model_state_to_cpu(model_state):
@@ -464,9 +520,11 @@ def model_state_to_cpu(model_state):
     return model_state_cpu
 
 
-def checkpoint_state(model=None, optimizer=None, epoch=None, it=None):
+def checkpoint_state(model=None, optimizer=None, epoch=None, it=None, model_state_override=None):
     optim_state = optimizer.state_dict() if optimizer is not None else None
-    if model is not None:
+    if model_state_override is not None:
+        model_state = model_state_to_cpu(model_state_override)
+    elif model is not None:
         if isinstance(model, torch.nn.parallel.DistributedDataParallel):
             model_state = model_state_to_cpu(model.module.state_dict())
         else:
