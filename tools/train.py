@@ -15,7 +15,7 @@ from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, model_fn_decorator
 from pcdet.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
-from train_utils.train_utils import train_model
+from train_utils.train_utils import ModelEMA, train_model
 
 
 def apply_train_freeze(model, cfg, logger):
@@ -118,6 +118,10 @@ def parse_config():
     
 
     parser.add_argument('--fp16', action='store_true', default=False, help='trigger mixed precision')
+    parser.add_argument('--ema', action='store_true', default=False, help='enable exponential moving average weights')
+    parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay when --ema is enabled')
+    parser.add_argument('--save_ema_as_model', action='store_true', default=False,
+                        help='save checkpoint_epoch_N.pth with EMA weights and keep raw weights as checkpoint_epoch_N_raw.pth')
 
     args = parser.parse_args()
 
@@ -206,6 +210,9 @@ def main():
     apply_train_freeze(model, cfg, logger)
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
+    model_ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
+    if model_ema is not None:
+        logger.info(f'EMA enabled: decay={args.ema_decay}, save_ema_as_model={args.save_ema_as_model}')
 
     if args.ckpt is not None:
         it, start_epoch = model.load_params_with_optimizer(args.ckpt, to_cpu=dist_train, optimizer=optimizer, logger=logger)
@@ -266,7 +273,9 @@ def main():
         use_logger_to_record=not args.use_tqdm_to_record, 
         show_gpu_stat=not args.wo_gpu_stat,
         fp16=args.fp16,
-        cfg=cfg
+        cfg=cfg,
+        model_ema=model_ema,
+        save_ema_as_model=args.save_ema_as_model
     )
 
     if hasattr(train_set, 'use_shared_memory') and train_set.use_shared_memory:
