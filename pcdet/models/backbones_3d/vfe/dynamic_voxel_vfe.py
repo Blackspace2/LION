@@ -11,6 +11,7 @@ except Exception as e:
 from .vfe_template import VFETemplate
 from .dynamic_pillar_vfe import PFNLayerV2
 from ..ground_context_utils import build_voxel_ground_context_from_inv
+from ..patch_context_utils import build_voxel_patch_context_from_inv
 
 
 class DynamicVoxelVFE(VFETemplate):
@@ -21,6 +22,7 @@ class DynamicVoxelVFE(VFETemplate):
         self.with_distance = self.model_cfg.WITH_DISTANCE
         self.use_absolute_xyz = self.model_cfg.USE_ABSLOTE_XYZ
         self.return_ground_context = bool(self.model_cfg.get('GROUND_CONTEXT_ENABLED', False))
+        self.return_patch_context = bool(self.model_cfg.get('PATCH_CONTEXT_ENABLED', False))
         num_point_features += 6 if self.use_absolute_xyz else 3
         if self.with_distance:
             num_point_features += 1
@@ -54,6 +56,7 @@ class DynamicVoxelVFE(VFETemplate):
         self.point_cloud_range = torch.tensor(point_cloud_range).cuda()
         self.point_feature_names = list(point_feature_names) if point_feature_names is not None else None
         self.ground_feature_indices = None
+        self.patch_feature_indices = None
         if self.return_ground_context:
             required_names = ['is_ground', 'delta_z_to_ground', 'ground_valid']
             if self.point_feature_names is None:
@@ -64,6 +67,29 @@ class DynamicVoxelVFE(VFETemplate):
                     f'GROUND_CONTEXT_ENABLED requires point features {missing_names}, got {self.point_feature_names}'
                 )
             self.ground_feature_indices = {
+                name: self.point_feature_names.index(name) + 1 for name in required_names
+            }
+        if self.return_patch_context:
+            required_names = [
+                'is_ground',
+                'patch_center_z',
+                'patch_normal_z',
+                'patch_flatness',
+                'patch_elevation',
+                'patch_point_count',
+                'patch_zone_id',
+                'patch_ring_id',
+                'patch_sector_id',
+                'point_patch_id',
+            ]
+            if self.point_feature_names is None:
+                raise ValueError('PATCH_CONTEXT_ENABLED requires point_feature_names to be passed into DynamicVoxelVFE')
+            missing_names = [name for name in required_names if name not in self.point_feature_names]
+            if missing_names:
+                raise ValueError(
+                    f'PATCH_CONTEXT_ENABLED requires point features {missing_names}, got {self.point_feature_names}'
+                )
+            self.patch_feature_indices = {
                 name: self.point_feature_names.index(name) + 1 for name in required_names
             }
 
@@ -125,5 +151,14 @@ class DynamicVoxelVFE(VFETemplate):
                 num_voxels=int(voxel_coords.shape[0]),
                 feature_indices=self.ground_feature_indices
             )
+        if self.return_patch_context:
+            voxel_patch_context_raw, voxel_patch_ids = build_voxel_patch_context_from_inv(
+                points=points,
+                unq_inv=unq_inv,
+                num_voxels=int(voxel_coords.shape[0]),
+                feature_indices=self.patch_feature_indices
+            )
+            batch_dict['voxel_patch_context_raw'] = voxel_patch_context_raw
+            batch_dict['voxel_patch_ids'] = voxel_patch_ids
 
         return batch_dict
