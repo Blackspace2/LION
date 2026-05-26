@@ -231,6 +231,11 @@ FP16="${FP16:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/project/LION/output/LION_output}"
 DATA_PATH="${DATA_PATH:-/root/autodl-tmp/kitti-offical}"
 INFO_PKL="${INFO_PKL:-${DATA_PATH}/kitti_infos_val.pkl}"
+TRAIN_SPLIT_NAME="${TRAIN_SPLIT_NAME:-}"
+TRAIN_INFO_PKL="${TRAIN_INFO_PKL:-}"
+TEST_SPLIT_NAME="${TEST_SPLIT_NAME:-}"
+TEST_INFO_PKL="${TEST_INFO_PKL:-}"
+EXTRA_SET_CFGS="${EXTRA_SET_CFGS:-}"
 PY310="${PY310:-/root/miniconda3/envs/lion_eval_py310/bin/python}"
 
 CFG_FILE=""
@@ -342,6 +347,7 @@ VARIANT="${VARIANT:-${DEFAULT_VARIANT}}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${DEFAULT_TRAIN_BATCH_SIZE}}"
 TRAIN_WORKERS="${TRAIN_WORKERS:-${DEFAULT_TRAIN_WORKERS}}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-${DEFAULT_TOTAL_EPOCHS}}"
+STOP_EPOCHS="${STOP_EPOCHS:-${TOTAL_EPOCHS}}"
 CKPT_SAVE_INTERVAL="${CKPT_SAVE_INTERVAL:-${DEFAULT_CKPT_SAVE_INTERVAL}}"
 MAX_CKPT_SAVE_NUM="${MAX_CKPT_SAVE_NUM:-${DEFAULT_MAX_CKPT_SAVE_NUM}}"
 LOGGER_ITER_INTERVAL="${LOGGER_ITER_INTERVAL:-${DEFAULT_LOGGER_ITER_INTERVAL}}"
@@ -449,6 +455,18 @@ append_guided_eval_set_args() {
 
 append_train_set_args() {
   SET_ARGS=(DATA_CONFIG.DATA_PATH "${DATA_PATH}")
+  if [[ -n "${TRAIN_SPLIT_NAME}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.DATA_SPLIT.train "${TRAIN_SPLIT_NAME}")
+  fi
+  if [[ -n "${TRAIN_INFO_PKL}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.INFO_PATH.train "['${TRAIN_INFO_PKL}']")
+  fi
+  if [[ -n "${TEST_SPLIT_NAME}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.DATA_SPLIT.test "${TEST_SPLIT_NAME}")
+  fi
+  if [[ -n "${TEST_INFO_PKL}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.INFO_PATH.test "['${TEST_INFO_PKL}']")
+  fi
   if [[ -n "${TRAIN_LR}" ]]; then
     SET_ARGS+=(OPTIMIZATION.LR "${TRAIN_LR}")
   fi
@@ -478,6 +496,18 @@ append_train_set_args() {
 
 append_eval_set_args() {
   SET_ARGS=(DATA_CONFIG.DATA_PATH "${DATA_PATH}")
+  if [[ -n "${TRAIN_SPLIT_NAME}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.DATA_SPLIT.train "${TRAIN_SPLIT_NAME}")
+  fi
+  if [[ -n "${TRAIN_INFO_PKL}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.INFO_PATH.train "['${TRAIN_INFO_PKL}']")
+  fi
+  if [[ -n "${TEST_SPLIT_NAME}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.DATA_SPLIT.test "${TEST_SPLIT_NAME}")
+  fi
+  if [[ -n "${TEST_INFO_PKL}" ]]; then
+    SET_ARGS+=(DATA_CONFIG.INFO_PATH.test "['${TEST_INFO_PKL}']")
+  fi
   case "${EXPERIMENT}" in
     ground-guided-diffusion)
       append_guided_eval_set_args
@@ -489,6 +519,15 @@ append_eval_set_args() {
       append_context_film_variant_set_args
       ;;
   esac
+}
+
+append_extra_set_args() {
+  if [[ -z "${EXTRA_SET_CFGS}" ]]; then
+    return
+  fi
+  local -a extra_args=()
+  read -r -a extra_args <<< "${EXTRA_SET_CFGS}"
+  SET_ARGS+=("${extra_args[@]}")
 }
 
 derive_extra_tag_from_ckpt() {
@@ -556,6 +595,7 @@ run_eval_single() {
   official_txt="${result_dir}/official_eval_ap_r40.txt"
 
   append_eval_set_args
+  append_extra_set_args
   CMD=(
     python test.py
     --cfg_file "${CFG_FILE}"
@@ -660,16 +700,17 @@ run_posttrain_eval() {
 run_train_once() {
   local extra_tag="$1"
   local total_epochs="$2"
-  local pretrained_ckpt="$3"
-  local resume_ckpt="$4"
-  shift 4
+  local stop_epochs="$3"
+  local pretrained_ckpt="$4"
+  local resume_ckpt="$5"
+  shift 5
   local -a extra_set_args=("$@")
   local -a cmd=(
     python train_no_builtin_eval.py
     --cfg_file "${CFG_FILE}"
     --batch_size "${TRAIN_BATCH_SIZE}"
     --workers "${TRAIN_WORKERS}"
-    --epochs "${total_epochs}"
+    --epochs "${stop_epochs}"
     --total_epochs "${total_epochs}"
     --extra_tag "${extra_tag}"
     --output_dir "${OUTPUT_ROOT}"
@@ -712,8 +753,9 @@ run_train_action() {
   require_file "${CFG_FILE}"
   require_dir "${DATA_PATH}"
   append_train_set_args
+  append_extra_set_args
 
-  run_train_once "${extra_tag}" "${TOTAL_EPOCHS}" "${PRETRAINED_CKPT:-}" "${RESUME_CKPT:-}" "${SET_ARGS[@]}"
+  run_train_once "${extra_tag}" "${TOTAL_EPOCHS}" "${STOP_EPOCHS}" "${PRETRAINED_CKPT:-}" "${RESUME_CKPT:-}" "${SET_ARGS[@]}"
 
   if [[ "${EVAL_AFTER_TRAIN}" == "1" ]]; then
     run_posttrain_eval "${extra_tag}"
@@ -735,7 +777,7 @@ run_staged_ground_adapter() {
   local stage1_ckpt stage2_ckpt
 
   echo "Stage 1: adapter only"
-  run_train_once "${stage1_tag}" "${stage1_epochs}" "${baseline_ckpt}" "" \
+  run_train_once "${stage1_tag}" "${stage1_epochs}" "${stage1_epochs}" "${baseline_ckpt}" "" \
     DATA_CONFIG.DATA_PATH "${DATA_PATH}" \
     OPTIMIZATION.LR "${stage1_lr}" \
     OPTIMIZATION.GRAD_NORM_CLIP "2" \
@@ -746,7 +788,7 @@ run_staged_ground_adapter() {
   require_file "${stage1_ckpt}"
 
   echo "Stage 2: adapter + bev backbone + dense head"
-  run_train_once "${stage2_tag}" "${stage2_epochs}" "${stage1_ckpt}" "" \
+  run_train_once "${stage2_tag}" "${stage2_epochs}" "${stage2_epochs}" "${stage1_ckpt}" "" \
     DATA_CONFIG.DATA_PATH "${DATA_PATH}" \
     OPTIMIZATION.LR "${stage2_lr}" \
     OPTIMIZATION.GRAD_NORM_CLIP "2" \
@@ -758,7 +800,7 @@ run_staged_ground_adapter() {
 
   if (( stage3_epochs > 0 )); then
     echo "Stage 3: full low-lr finetune"
-    run_train_once "${stage3_tag}" "${stage3_epochs}" "${stage2_ckpt}" "" \
+    run_train_once "${stage3_tag}" "${stage3_epochs}" "${stage3_epochs}" "${stage2_ckpt}" "" \
       DATA_CONFIG.DATA_PATH "${DATA_PATH}" \
       OPTIMIZATION.LR "${stage3_lr}" \
       OPTIMIZATION.GRAD_NORM_CLIP "2" \
@@ -780,7 +822,7 @@ run_staged_ground_guided_diffusion() {
   local stage1_ckpt stage2_ckpt
 
   echo "Stage 1: train only the new ground-guided score parameters"
-  run_train_once "${stage1_tag}" "${stage1_epochs}" "${baseline_ckpt}" "" \
+  run_train_once "${stage1_tag}" "${stage1_epochs}" "${stage1_epochs}" "${baseline_ckpt}" "" \
     DATA_CONFIG.DATA_PATH "${DATA_PATH}" \
     MODEL.BACKBONE_3D.GROUND_GUIDED_DIFFUSION.ABLATION_MODE "${guided_mode}" \
     OPTIMIZATION.LR "${stage1_lr}" \
@@ -792,7 +834,7 @@ run_staged_ground_guided_diffusion() {
   require_file "${stage1_ckpt}"
 
   echo "Stage 2: full finetune"
-  run_train_once "${stage2_tag}" "${stage2_epochs}" "${stage1_ckpt}" "" \
+  run_train_once "${stage2_tag}" "${stage2_epochs}" "${stage2_epochs}" "${stage1_ckpt}" "" \
     DATA_CONFIG.DATA_PATH "${DATA_PATH}" \
     MODEL.BACKBONE_3D.GROUND_GUIDED_DIFFUSION.ABLATION_MODE "${guided_mode}" \
     OPTIMIZATION.LR "${stage2_lr}" \
