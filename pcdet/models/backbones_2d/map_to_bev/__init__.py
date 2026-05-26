@@ -5,6 +5,7 @@ from .height_compression import (
     HeightCompression_VoxelNext,
     GroundDefectHeightCompression,
     GroundAwareHeightCompression,
+    BEVOccupancyGuidanceHeightCompression,
 )
 from .pointpillar_scatter import PointPillarScatter
 from .pointpillar3d_scatter import PointPillarScatter3d, PointPillarScatter3d_for_Sparse_BEV, PointPillarScatter3d_for_Dense_BEV
@@ -24,4 +25,5 @@ __all__ = {
     'HeightCompression_VoxelNext': HeightCompression_VoxelNext,
     'GroundDefectHeightCompression': GroundDefectHeightCompression,
     'GroundAwareHeightCompression': GroundAwareHeightCompression,
+    'BEVOccupancyGuidanceHeightCompression': BEVOccupancyGuidanceHeightCompression,
 }
