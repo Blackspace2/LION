@@ -67,23 +67,59 @@ def _collect_named_grad_norms(model):
                     )
                 )
             )
-
-    map_to_bev_cfg = getattr(model_cfg, 'MAP_TO_BEV', None)
-    if map_to_bev_cfg is not None and map_to_bev_cfg.get('NAME', None) == 'GroundDefectHeightCompression':
-        keywords.extend(
-            list(
-                map_to_bev_cfg.get(
-                    'GRAD_LOG_KEYWORDS',
-                    [
-                        'map_to_bev_module.defect_encoder',
-                        'map_to_bev_module.defect_head',
-                        'map_to_bev_module.gate_head',
-                        'map_to_bev_module.residual_head',
-                        'map_to_bev_module.residual_scale',
-                    ]
+        patchwork_cfg = backbone_cfg.get('PATCHWORK_GUIDANCE', None)
+        if patchwork_cfg is not None and patchwork_cfg.get('ENABLED', False):
+            keywords.extend(
+                list(
+                    patchwork_cfg.get(
+                        'GRAD_LOG_KEYWORDS',
+                        [
+                            'backbone_3d.patch_token_encoder',
+                            'backbone_3d.patch_context_encoder',
+                            'backbone_3d.patch_topology_embedding',
+                            'backbone_3d.patch_guidance_pre',
+                            'backbone_3d.patch_guidance_logits',
+                            'backbone_3d.patch_guidance_gates',
+                            'backbone_3d.patch_guidance_residuals',
+                            'backbone_3d.patch_guidance_residual_scale',
+                        ]
+                    )
                 )
             )
-        )
+
+    map_to_bev_cfg = getattr(model_cfg, 'MAP_TO_BEV', None)
+    if map_to_bev_cfg is not None:
+        map_to_bev_name = map_to_bev_cfg.get('NAME', None)
+        if map_to_bev_name == 'GroundDefectHeightCompression':
+            keywords.extend(
+                list(
+                    map_to_bev_cfg.get(
+                        'GRAD_LOG_KEYWORDS',
+                        [
+                            'map_to_bev_module.defect_encoder',
+                            'map_to_bev_module.defect_head',
+                            'map_to_bev_module.gate_head',
+                            'map_to_bev_module.residual_head',
+                            'map_to_bev_module.residual_scale',
+                        ]
+                    )
+                )
+            )
+        elif map_to_bev_name == 'BEVOccupancyGuidanceHeightCompression':
+            keywords.extend(
+                list(
+                    map_to_bev_cfg.get(
+                        'GRAD_LOG_KEYWORDS',
+                        [
+                            'map_to_bev_module.context_encoder',
+                            'map_to_bev_module.occupancy_head',
+                            'map_to_bev_module.inject_head',
+                            'map_to_bev_module.gate_head',
+                            'map_to_bev_module.fusion_head',
+                        ]
+                    )
+                )
+            )
 
     if len(keywords) == 0:
         return {}
@@ -149,6 +185,9 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             batch = next(dataloader_iter)
             print('new iters')
 
+        batch['cur_epoch'] = int(cur_epoch) if cur_epoch is not None else -1
+        batch['total_epochs'] = int(total_epochs) if total_epochs is not None else 0
+
         data_timer = time.time()
         cur_data_time = data_timer - end
 
@@ -158,9 +197,6 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             cur_lr = float(optimizer.lr)
         except:
             cur_lr = optimizer.param_groups[0]['lr']
-
-        if tb_log is not None:
-            tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
 
         model.train()
         _set_frozen_batchnorm_eval(model)
