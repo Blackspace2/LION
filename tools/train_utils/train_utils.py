@@ -118,6 +118,19 @@ def _collect_named_grad_norms(model):
                     )
                 )
             )
+        lion_improve_cfg = backbone_cfg.get('LION_IMPROVE', None)
+        if lion_improve_cfg is not None and lion_improve_cfg.get('ENABLED', False):
+            keywords.extend(
+                list(
+                    lion_improve_cfg.get(
+                        'GRAD_LOG_KEYWORDS',
+                        [
+                            'lion_improve',
+                            'serialization',
+                        ]
+                    )
+                )
+            )
 
     map_to_bev_cfg = getattr(model_cfg, 'MAP_TO_BEV', None)
     if map_to_bev_cfg is not None:
