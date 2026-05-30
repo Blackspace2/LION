@@ -97,6 +97,7 @@ def parse_config():
     parser.add_argument('--tcp_port', type=int, default=18888, help='tcp port for distrbuted training')
     parser.add_argument('--sync_bn', action='store_true', default=False, help='whether to use sync bn')
     parser.add_argument('--fix_random_seed', action='store_true', default=False, help='')
+    parser.add_argument('--seed', type=int, default=666, help='random seed used when --fix_random_seed is set')
     parser.add_argument('--ckpt_save_interval', type=int, default=1, help='number of training epochs')
     parser.add_argument('--local-rank', type=int, default=0, help='local rank for distributed training')
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
@@ -157,7 +158,7 @@ def main():
     assert args.total_epochs >= args.epochs, 'total_epochs should be >= epochs'
 
     if args.fix_random_seed:
-        common_utils.set_random_seed(666 + cfg.LOCAL_RANK)
+        common_utils.set_random_seed(args.seed + cfg.LOCAL_RANK)
 
     output_root = args.output_dir if args.output_dir is not None else cfg.ROOT_DIR / 'output'
     output_dir = output_root / cfg.EXP_GROUP_PATH / cfg.TAG / args.extra_tag
@@ -193,7 +194,7 @@ def main():
         training=True,
         merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
         total_epochs=args.total_epochs,
-        seed=666 if args.fix_random_seed else None
+        seed=args.seed if args.fix_random_seed else None
     )
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set)
