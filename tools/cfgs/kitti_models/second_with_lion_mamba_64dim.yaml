@@ -79,6 +79,37 @@ MODEL:
                 d_conv: 4
                 expand: 2
                 drop_path: 0.2
+        LION_IMPROVE:
+            ENABLED: False
+            GRAD_LOG_KEYWORDS: ['lion_improve', 'serialization']
+            GRAPH:
+                ENABLED: False
+                NEIGHBORHOOD: 26
+                SIGMA_P: 1.5
+                SIGMA_RHO: 1.0
+                RESPONSE_DETACH: True
+                RESPONSE_GAMMA: 0.25
+                DENSITY_RANGE_ALPHA: 0.001
+            SERIALIZATION:
+                ENABLED: False
+                EXECUTION_MODE: serial
+                ORDERS: ['x', 'y']
+                STAGE_ORDERS:
+                    ENABLED: False
+                    linear_1: ['x', 'y']
+                    linear_2: ['x', 'y']
+                    linear_3: ['x', 'y']
+                    linear_4: ['x', 'y']
+                    linear_out: ['x', 'y']
+                VALIDATE_MAPPING: False
+                HEAT_RANK_ITERS: 4
+                HEAT_RANK_ALPHA: 0.65
+                RETENTION_TAU: 256.0
+                TEAR_THRESHOLD: 1024.0
+            DIAGNOSTICS:
+                ENABLED: False
+                LOG_INTERVAL: 50
+                SAVE_VIS: False
 
     MAP_TO_BEV:
         NAME: HeightCompression
