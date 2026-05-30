@@ -1,5 +1,6 @@
 from functools import partial
 
+import copy
 import os
 import math
 import numpy as np
@@ -16,6 +17,15 @@ from ..model_utils.ttt import TTTBlock
 from .ground_context_utils import pool_ground_context_to_sparse_coords
 from .patch_context_utils import PATCH_CONTEXT_RAW_DIM, pool_patch_context_to_sparse_coords
 from .sbsd import SBSD
+from .lion_improve import (
+    GEOMETRY_ORDER_NAMES,
+    build_geometry_order_from_coords,
+    build_serialization_graph_context,
+    build_topology_order_from_context,
+    cfg_get,
+    diagnose_order,
+    reverse_order_within_batches,
+)
 from ...utils.spconv_utils import replace_feature, spconv
 import torch.utils.checkpoint as cp
 
@@ -520,7 +530,6 @@ class PatchMerging3D(nn.Module):
         unq_coords, unq_inv = torch.unique(merge_coords, return_inverse=True, return_counts=False, dim=0)
 
         x_merge = torch_scatter.scatter_add(features_expand, unq_inv, dim=0)
-
         unq_coords = unq_coords.int()
         voxel_coords = torch.stack((unq_coords // scale_xyz,
                                     (unq_coords % scale_xyz) // scale_yz,
@@ -571,32 +580,248 @@ LinearOperatorMap = {
 }
 
 
+_AXIS_ORDER_NAMES = {
+    'x',
+    'y',
+    'x_shift',
+    'y_shift',
+    'x_xy',
+    'y_xy',
+    'x_yx',
+    'y_yx',
+}
+_GEOMETRY_ORDER_NAMES = set(GEOMETRY_ORDER_NAMES)
+_TOPOLOGY_ORDER_NAMES = {'topology', 'topology_rev'}
+_STAGE_ORDER_KEYS = ['linear_1', 'linear_2', 'linear_3', 'linear_4', 'linear_out']
+
+
+def _as_order_list(orders, context_name):
+    if orders is None:
+        return None
+    if isinstance(orders, str):
+        values = [item.strip() for item in orders.split(',') if item.strip()]
+    else:
+        values = list(orders)
+    if len(values) == 0:
+        raise ValueError(f'{context_name} must contain at least one order')
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f'{context_name} must be a list of order names, got {orders}')
+    return values
+
+
+def _stage_key_from_debug_name(debug_name):
+    for key in _STAGE_ORDER_KEYS:
+        if debug_name == key or debug_name.startswith(key + '_'):
+            return key
+    return debug_name
+
+
+def _resolve_serialization_direction(serialization_cfg, default_direction, debug_name):
+    stage_orders = cfg_get(serialization_cfg, 'STAGE_ORDERS', None)
+    if stage_orders is None:
+        stage_policy_active = False
+    elif isinstance(stage_orders, dict) or hasattr(stage_orders, 'get'):
+        stage_policy_active = bool(cfg_get(stage_orders, 'ENABLED', False))
+    else:
+        stage_policy_active = len(stage_orders) > 0
+    if not stage_policy_active:
+        return _as_order_list(
+            cfg_get(serialization_cfg, 'ORDERS', default_direction),
+            'LION_IMPROVE.SERIALIZATION.ORDERS',
+        ), False
+
+    stage_key = _stage_key_from_debug_name(debug_name)
+    resolved_orders = None
+    if isinstance(stage_orders, dict) or hasattr(stage_orders, 'get'):
+        resolved_orders = cfg_get(stage_orders, debug_name, None)
+        if resolved_orders is None:
+            resolved_orders = cfg_get(stage_orders, stage_key, None)
+        if resolved_orders is None:
+            resolved_orders = cfg_get(stage_orders, 'default', None)
+    else:
+        stage_idx = _STAGE_ORDER_KEYS.index(stage_key) if stage_key in _STAGE_ORDER_KEYS else None
+        if stage_idx is not None and stage_idx < len(stage_orders):
+            resolved_orders = stage_orders[stage_idx]
+
+    if resolved_orders is None:
+        return list(default_direction), True
+    return _as_order_list(resolved_orders, f'LION_IMPROVE.SERIALIZATION.STAGE_ORDERS[{stage_key}]'), True
+
+
 class LIONLayer(nn.Module):
-    def __init__(self, dim, nums, window_shape, group_size, direction, shift, operator=None, layer_id=0, n_layer=0):
+    def __init__(
+        self,
+        dim,
+        nums,
+        window_shape,
+        group_size,
+        direction,
+        shift,
+        operator=None,
+        layer_id=0,
+        n_layer=0,
+        lion_improve_cfg=None,
+        debug_name='lion_layer',
+    ):
         super(LIONLayer, self).__init__()
 
         self.window_shape = window_shape
         self.group_size = group_size
         self.dim = dim
-        self.direction = direction
+        self.debug_name = debug_name
+        self.lion_improve_cfg = lion_improve_cfg
+        self.lion_improve_enabled = lion_improve_cfg is not None and bool(cfg_get(lion_improve_cfg, 'ENABLED', False))
+        self.serialization_cfg = cfg_get(lion_improve_cfg, 'SERIALIZATION', None) if self.lion_improve_enabled else None
+        self.scan_order_config_enabled = (
+            self.serialization_cfg is not None and bool(cfg_get(self.serialization_cfg, 'ENABLED', False))
+        )
+        if self.scan_order_config_enabled:
+            self.direction, self.serialization_stage_policy_active = _resolve_serialization_direction(
+                self.serialization_cfg, direction, debug_name
+            )
+        else:
+            self.direction = list(direction)
+            self.serialization_stage_policy_active = False
+        self.geometry_order_enabled = any(order_name in _GEOMETRY_ORDER_NAMES for order_name in self.direction)
+        self.topology_order_enabled = any(order_name in _TOPOLOGY_ORDER_NAMES for order_name in self.direction)
+        self.serialization_execution_mode = 'serial'
+        if self.scan_order_config_enabled:
+            self.serialization_execution_mode = str(cfg_get(self.serialization_cfg, 'EXECUTION_MODE', 'serial')).lower()
+            if self.serialization_execution_mode == 'sequential':
+                self.serialization_execution_mode = 'serial'
+            if self.serialization_execution_mode != 'serial':
+                raise ValueError(
+                    f'{self.debug_name}: unsupported LION_IMPROVE.SERIALIZATION.EXECUTION_MODE='
+                    f'{self.serialization_execution_mode!r}; only strict serial execution is supported'
+                )
+        for order_name in self.direction:
+            if (
+                order_name not in _AXIS_ORDER_NAMES
+                and order_name not in _GEOMETRY_ORDER_NAMES
+                and order_name not in _TOPOLOGY_ORDER_NAMES
+            ):
+                raise ValueError(f'{self.debug_name}: unsupported scan order "{order_name}"')
+        self.serialization_validate_mapping = (
+            bool(cfg_get(self.serialization_cfg, 'VALIDATE_MAPPING', False))
+            if self.scan_order_config_enabled
+            else False
+        )
 
-        operator_cfg = operator.CFG
+        operator_cfg = copy.deepcopy(operator.CFG)
         operator_cfg['d_model'] = dim
 
         block_list = []
-        for i in range(len(direction)):
-            operator_cfg['layer_id'] = i + layer_id
-            operator_cfg['n_layer'] = n_layer
+        for i in range(len(self.direction)):
+            cur_operator_cfg = copy.deepcopy(operator_cfg)
+            cur_operator_cfg['layer_id'] = i + layer_id
+            cur_operator_cfg['n_layer'] = n_layer
             # operator_cfg['with_cp'] = layer_id >= 16
-            operator_cfg['with_cp'] = layer_id >= 0 ## all lion layer use checkpoint to save GPU memory!! (less 24G for training all models!!!)
+            cur_operator_cfg['with_cp'] = layer_id >= 0 ## all lion layer use checkpoint to save GPU memory!! (less 24G for training all models!!!)
             print('### use part of checkpoint!!')
-            block_list.append(LinearOperatorMap[operator.NAME](**operator_cfg))
+            block_list.append(LinearOperatorMap[operator.NAME](**cur_operator_cfg))
 
         self.blocks = nn.ModuleList(block_list)
         self.window_partition = FlattenedWindowMapping(self.window_shape, self.group_size, shift)
 
-    def forward(self, x):
+    def _should_record_serialization_metrics(self, lion_improve_state):
+        if not (self.geometry_order_enabled or self.topology_order_enabled) or lion_improve_state is None:
+            return False
+        diagnostics_cfg = cfg_get(self.lion_improve_cfg, 'DIAGNOSTICS', None)
+        if diagnostics_cfg is None or not bool(cfg_get(diagnostics_cfg, 'ENABLED', False)):
+            return False
+        if not self.training:
+            return True
+        global_step = max(int(lion_improve_state.get('global_step', 0)), 0)
+        interval = max(int(cfg_get(diagnostics_cfg, 'LOG_INTERVAL', 50)), 1)
+        return (global_step % interval) == 0
+
+    def _build_topology_context(self, x):
+        return build_serialization_graph_context(
+            coords=x.indices,
+            features=x.features,
+            spatial_shape=x.spatial_shape,
+            batch_size=x.batch_size,
+            cfg=self.lion_improve_cfg,
+        )
+
+    def _add_serialization_mappings(self, mappings, x, lion_improve_state=None):
+        context = None
+        for order_name in self.direction:
+            if order_name not in _GEOMETRY_ORDER_NAMES or order_name in mappings:
+                continue
+            mappings[order_name] = build_geometry_order_from_coords(
+                coords=x.indices,
+                sparse_shape=x.spatial_shape,
+                window_shape=self.window_shape,
+                shift=self.window_partition.shift,
+                order_name=order_name,
+            )
+        if self.topology_order_enabled:
+            context = self._build_topology_context(x)
+            topology_order = None
+            if 'topology' in self.direction or 'topology_rev' in self.direction:
+                topology_order = build_topology_order_from_context(
+                    context=context,
+                    fallback_order=mappings.get('x', None),
+                    cfg=self.lion_improve_cfg,
+                )
+            if 'topology' in self.direction:
+                mappings['topology'] = topology_order
+            if 'topology_rev' in self.direction:
+                mappings['topology_rev'] = reverse_order_within_batches(topology_order, x.indices, x.batch_size)
+        elif self._should_record_serialization_metrics(lion_improve_state):
+            context = self._build_topology_context(x)
+        return context
+
+    def _record_serialization_metrics(self, lion_improve_state, context, mappings):
+        if not self._should_record_serialization_metrics(lion_improve_state):
+            return
+        if context is None:
+            return
+        serialization_cfg = cfg_get(self.lion_improve_cfg, 'SERIALIZATION', None)
+        retention_tau = float(cfg_get(serialization_cfg, 'RETENTION_TAU', max(float(self.group_size) / 16.0, 1.0)))
+        tear_threshold = float(cfg_get(serialization_cfg, 'TEAR_THRESHOLD', max(float(self.group_size) / 4.0, 1.0)))
+        tb_dict = lion_improve_state.setdefault('tb_dict', {})
+        for order_name in self.direction:
+            if order_name not in mappings:
+                continue
+            tb_dict.update(diagnose_order(
+                context=context,
+                order=mappings[order_name],
+                prefix=f'lion_improve/serialization/{self.debug_name}/{order_name}',
+                retention_tau=retention_tau,
+                tear_threshold=tear_threshold,
+            ))
+
+    def _validate_serialization_mappings(self, mappings, num_nodes):
+        if not self.serialization_validate_mapping:
+            return
+        device = mappings['win2flat'].device
+        expected = torch.arange(num_nodes, device=device, dtype=torch.long)
+        if mappings['flat2win'].numel() > 0 and not torch.equal(mappings['flat2win'][mappings['win2flat']], expected):
+            raise RuntimeError(f'{self.debug_name}: flat2win/win2flat inverse check failed')
+        for order_name in self.direction:
+            indices = mappings.get(order_name, None)
+            if indices is None:
+                raise RuntimeError(f'{self.debug_name}: missing mapping for order {order_name}')
+            if indices.numel() != num_nodes or not torch.equal(torch.sort(indices).values, expected):
+                raise RuntimeError(f'{self.debug_name}: order {order_name} is not a valid permutation')
+
+    def _build_order_mappings(self, x, lion_improve_state=None):
         mappings = self.window_partition(x.indices, x.batch_size, x.spatial_shape)
+        context = None
+        if self.geometry_order_enabled or self.topology_order_enabled:
+            context = self._add_serialization_mappings(mappings, x, lion_improve_state=lion_improve_state)
+        self._validate_serialization_mappings(mappings, x.features.shape[0])
+        self._record_serialization_metrics(lion_improve_state, context, mappings)
+        return mappings
+
+    def _forward_serial(self, x, lion_improve_state=None):
+        if self.geometry_order_enabled or self.topology_order_enabled:
+            mappings = self._build_order_mappings(x, lion_improve_state=lion_improve_state)
+        else:
+            mappings = self.window_partition(x.indices, x.batch_size, x.spatial_shape)
 
         for i, block in enumerate(self.blocks):
             indices = mappings[self.direction[i]]
@@ -606,9 +831,17 @@ class LIONLayer(nn.Module):
             x_features = block(x_features)
 
             x_features = x_features.view(-1, x_features.shape[-1])[mappings["win2flat"]]
-            x.features[indices] = x_features.to(dtype=x.features.dtype)
+            if self.topology_order_enabled:
+                updated_features = x.features.clone()
+                updated_features[indices] = x_features.to(dtype=x.features.dtype)
+                x = replace_feature(x, updated_features)
+            else:
+                x.features[indices] = x_features.to(dtype=x.features.dtype)
 
         return x
+
+    def forward(self, x, lion_improve_state=None):
+        return self._forward_serial(x, lion_improve_state=lion_improve_state)
 
 
 class PositionEmbeddingLearned(nn.Module):
@@ -708,7 +941,7 @@ class FiLMHead(nn.Module):
 class LIONBlock(nn.Module):
     def __init__(self, dim: int, depth: int, down_scales: list, window_shape, group_size, direction, shift=False,
                  operator=None, layer_id=0, n_layer=0, ground_guided_cfg=None, sbsd_cfg=None, debug_prefix='lion_block',
-                 pos_input_channel=3, point_cloud_range=None):
+                 pos_input_channel=3, point_cloud_range=None, lion_improve_cfg=None):
         super().__init__()
 
         self.down_scales = down_scales
@@ -721,7 +954,10 @@ class LIONBlock(nn.Module):
 
         shift = [False, shift]
         for idx in range(depth):
-            self.encoder.append(LIONLayer(dim, 1, window_shape, group_size, direction, shift[idx], operator, layer_id + idx * 2, n_layer))
+            self.encoder.append(LIONLayer(
+                dim, 1, window_shape, group_size, direction, shift[idx], operator, layer_id + idx * 2, n_layer,
+                lion_improve_cfg=lion_improve_cfg, debug_name=f'{debug_prefix}_enc{idx + 1}'
+            ))
             self.pos_emb_list.append(PositionEmbeddingLearned(input_channel=pos_input_channel, num_pos_feats=dim))
             self.downsample_list.append(
                 PatchMerging3D(
@@ -740,13 +976,16 @@ class LIONBlock(nn.Module):
         self.decoder_norm = nn.ModuleList()
         self.upsample_list = nn.ModuleList()
         for idx in range(depth):
-            self.decoder.append(LIONLayer(dim, 1, window_shape, group_size, direction, shift[idx], operator, layer_id + 2 * (idx + depth), n_layer))
+            self.decoder.append(LIONLayer(
+                dim, 1, window_shape, group_size, direction, shift[idx], operator, layer_id + 2 * (idx + depth), n_layer,
+                lion_improve_cfg=lion_improve_cfg, debug_name=f'{debug_prefix}_dec{idx + 1}'
+            ))
             self.decoder_norm.append(norm_fn(dim))
             
             self.upsample_list.append(PatchExpanding3D(dim))
             
 
-    def forward(self, x, prior_context=None, patch_pos_context=None, patch_topology_embed=None):
+    def forward(self, x, prior_context=None, patch_pos_context=None, patch_topology_embed=None, lion_improve_state=None):
         features = []
         index = []
 
@@ -763,7 +1002,7 @@ class LIONBlock(nn.Module):
                                          patch_topology_embed=cur_patch_topology)
 
             x = replace_feature(x, pos_emb + x.features)  # x + pos_emb
-            x = enc(x)
+            x = enc(x, lion_improve_state=lion_improve_state)
             features.append(x)
             x, unq_inv = self.downsample_list[idx](x, prior_context=prior_context)
             index.append(unq_inv)
@@ -771,7 +1010,7 @@ class LIONBlock(nn.Module):
         i = 0
         for dec, norm, up_x, unq_inv, up_scale in zip(self.decoder, self.decoder_norm, features[::-1],
                                                       index[::-1], self.down_scales[::-1]):
-            x = dec(x)
+            x = dec(x, lion_improve_state=lion_improve_state)
             x = self.upsample_list[i](x, up_x, unq_inv)
             x = replace_feature(x, norm(x.features))
             i = i + 1
@@ -871,6 +1110,8 @@ class LION3DBackboneOneStride(nn.Module):
         self.patchwork_guidance_enabled = (
             self.patchwork_guidance_cfg is not None and self.patchwork_guidance_cfg.get('ENABLED', False)
         )
+        self.lion_improve_cfg = model_cfg.get('LION_IMPROVE', None)
+        self.lion_improve_enabled = self.lion_improve_cfg is not None and self.lion_improve_cfg.get('ENABLED', False)
         enabled_guidance_modes = sum([
             int(self.ground_guided_enabled),
             int(self.ground_context_enabled),
@@ -955,50 +1196,58 @@ class LION3DBackboneOneStride(nn.Module):
         assert len(layer_down_scales[0]) == depths[0]
         assert len(self.layer_dim) == len(depths)
 
-        
         self.linear_1 = LIONBlock(self.layer_dim[0], depths[0], layer_down_scales[0], self.window_shape[0],
                                     self.group_size[0], direction, shift=shift, operator=self.linear_operator, layer_id=0,
                                     n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_1',
-                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)  ##[27, 27, 32] --》 [13, 13, 32]
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range,
+                                    lion_improve_cfg=self.lion_improve_cfg)  ##[27, 27, 32] --》 [13, 13, 32]
 
         self.dow1 = PatchMerging3D(self.layer_dim[0], self.layer_dim[0], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
-                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow1')
+                                     ground_guided_cfg=self.ground_guided_cfg,
+                                     debug_name='dow1')
         
 
         # [944, 944, 16] -> [472, 472, 8]
         self.linear_2 = LIONBlock(self.layer_dim[1], depths[1], layer_down_scales[1], self.window_shape[1],
                                     self.group_size[1], direction, shift=shift, operator=self.linear_operator, layer_id=8,
                                     n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_2',
-                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range,
+                                    lion_improve_cfg=self.lion_improve_cfg)
 
         self.dow2 = PatchMerging3D(self.layer_dim[1], self.layer_dim[1], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
-                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow2')
+                                     ground_guided_cfg=self.ground_guided_cfg,
+                                     debug_name='dow2')
 
 
         #  [236, 236, 8] -> [236, 236, 4]
         self.linear_3 = LIONBlock(self.layer_dim[2], depths[2], layer_down_scales[2], self.window_shape[2],
                                     self.group_size[2], direction, shift=shift, operator=self.linear_operator, layer_id=16,
                                     n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_3',
-                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range,
+                                    lion_improve_cfg=self.lion_improve_cfg)
 
         self.dow3 = PatchMerging3D(self.layer_dim[2], self.layer_dim[3], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
-                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow3')
+                                     ground_guided_cfg=self.ground_guided_cfg,
+                                     debug_name='dow3')
 
         #  [236, 236, 4] -> [236, 236, 2]
         self.linear_4 = LIONBlock(self.layer_dim[3], depths[3], layer_down_scales[3], self.window_shape[3],
                                     self.group_size[3], direction, shift=shift, operator=self.linear_operator, layer_id=24,
                                     n_layer=self.n_layer, ground_guided_cfg=self.ground_guided_cfg, sbsd_cfg=self.sbsd_cfg, debug_prefix='linear_4',
-                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range)
+                                    pos_input_channel=self.patch_position_input_dim, point_cloud_range=point_cloud_range,
+                                    lion_improve_cfg=self.lion_improve_cfg)
 
         self.dow4 = PatchMerging3D(self.layer_dim[3], self.layer_dim[3], down_scale=[1, 1, 2],
                                      norm_layer=norm_fn, diffusion=diffusion, diff_scale=diff_scale,
-                                     ground_guided_cfg=self.ground_guided_cfg, debug_name='dow4')
+                                     ground_guided_cfg=self.ground_guided_cfg,
+                                     debug_name='dow4')
 
         self.linear_out = LIONLayer(self.layer_dim[3], 1, [13, 13, 2], 256, direction=['x', 'y'], shift=shift,
-                                      operator=self.linear_operator, layer_id=32, n_layer=self.n_layer)
+                                      operator=self.linear_operator, layer_id=32, n_layer=self.n_layer,
+                                      lion_improve_cfg=self.lion_improve_cfg, debug_name='linear_out')
 
         self.stage_strides_xyz = [
             [1, 1, 1],
@@ -1225,6 +1474,14 @@ class LION3DBackboneOneStride(nn.Module):
         return {
             'points': points,
             'patch_infos': patch_infos,
+            'tb_dict': {},
+            'global_step': int(batch_dict.get('global_step', 0)),
+        }
+
+    def build_lion_improve_state(self, batch_dict):
+        if not self.lion_improve_enabled:
+            return None
+        return {
             'tb_dict': {},
             'global_step': int(batch_dict.get('global_step', 0)),
         }
@@ -1541,6 +1798,7 @@ class LION3DBackboneOneStride(nn.Module):
         prior_context = self.build_ground_guided_prior_context(batch_dict)
         ground_context_state = self.build_ground_context_state(batch_dict)
         patchwork_state = self.build_patchwork_state(batch_dict)
+        lion_improve_state = self.build_lion_improve_state(batch_dict)
         self.forward_ret_dict = {}
 
         x = spconv.SparseConvTensor(
@@ -1579,7 +1837,8 @@ class LION3DBackboneOneStride(nn.Module):
             x,
             prior_context=prior_context,
             patch_pos_context=stage0_patch_pos,
-            patch_topology_embed=stage0_patch_topology
+            patch_topology_embed=stage0_patch_topology,
+            lion_improve_state=lion_improve_state
         )
         x1, _ = self.dow1(x, prior_context=prior_context)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
         stage1_patch_pos = None
@@ -1604,7 +1863,8 @@ class LION3DBackboneOneStride(nn.Module):
             x1,
             prior_context=prior_context,
             patch_pos_context=stage1_patch_pos,
-            patch_topology_embed=stage1_patch_topology
+            patch_topology_embed=stage1_patch_topology,
+            lion_improve_state=lion_improve_state
         )
         x2, _ = self.dow2(x, prior_context=prior_context)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
         stage2_patch_pos = None
@@ -1629,7 +1889,8 @@ class LION3DBackboneOneStride(nn.Module):
             x2,
             prior_context=prior_context,
             patch_pos_context=stage2_patch_pos,
-            patch_topology_embed=stage2_patch_topology
+            patch_topology_embed=stage2_patch_topology,
+            lion_improve_state=lion_improve_state
         )
         x3, _ = self.dow3(x, prior_context=prior_context)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
         stage3_patch_pos = None
@@ -1654,10 +1915,11 @@ class LION3DBackboneOneStride(nn.Module):
             x3,
             prior_context=prior_context,
             patch_pos_context=stage3_patch_pos,
-            patch_topology_embed=stage3_patch_topology
+            patch_topology_embed=stage3_patch_topology,
+            lion_improve_state=lion_improve_state
         )
         x4, _ = self.dow4(x, prior_context=prior_context)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
-        x = self.linear_out(x4)
+        x = self.linear_out(x4, lion_improve_state=lion_improve_state)
         if self.patchwork_guidance_enabled:
             guidance_patch_context_raw, guidance_patch_ids = self.pool_patch_context_raw(
                 points=patchwork_state['points'],
@@ -1702,6 +1964,8 @@ class LION3DBackboneOneStride(nn.Module):
             batch_dict['ground_context_tb_dict'] = ground_context_state['tb_dict']
         if patchwork_state is not None and patchwork_state['tb_dict']:
             batch_dict['patchwork_tb_dict'] = patchwork_state['tb_dict']
+        if lion_improve_state is not None and lion_improve_state['tb_dict']:
+            batch_dict['lion_improve_tb_dict'] = lion_improve_state['tb_dict']
 
         return batch_dict
 
