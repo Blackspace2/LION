@@ -144,6 +144,7 @@ class DynamicVoxelVFE(VFETemplate):
 
         batch_dict['pillar_features'] = batch_dict['voxel_features'] = features
         batch_dict['voxel_coords'] = voxel_coords
+        batch_dict['voxel_num_points'] = unq_cnt.to(device=features.device, dtype=features.dtype)
         if self.return_ground_context:
             batch_dict['voxel_ground_context_raw'] = build_voxel_ground_context_from_inv(
                 points=points,
