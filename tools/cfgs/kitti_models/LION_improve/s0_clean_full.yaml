@@ -1,0 +1,20 @@
+_BASE_CONFIG_: cfgs/kitti_models/second_with_lion_mamba_64dim.yaml
+
+DATA_CONFIG:
+    DATASET: KittiDataset
+    DATA_PATH: '../data/kitti'
+    DATA_SPLIT: {
+        'train': train,
+        'test': val
+    }
+    INFO_PATH: {
+        'train': [kitti_infos_train.pkl],
+        'test': [kitti_infos_val.pkl],
+    }
+    GET_ITEM_LIST: ['points']
+    FOV_POINTS_ONLY: True
+    POINT_FEATURE_ENCODING: {
+        encoding_type: absolute_coordinates_encoding,
+        used_feature_list: ['x', 'y', 'z', 'intensity'],
+        src_feature_list: ['x', 'y', 'z', 'intensity'],
+    }
