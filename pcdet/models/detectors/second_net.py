@@ -32,6 +32,7 @@ class SECONDNet(Detector3DTemplate):
         tb_dict.update(self.forward_ret_dict.get('ground_context_tb_dict', {}))
         tb_dict.update(self.forward_ret_dict.get('patchwork_tb_dict', {}))
         tb_dict.update(self.forward_ret_dict.get('lion_improve_tb_dict', {}))
+        tb_dict.update(self.forward_ret_dict.get('pass_fusion_tb_dict', {}))
         loss = loss_rpn
 
         if hasattr(self.backbone_3d, 'get_loss'):
