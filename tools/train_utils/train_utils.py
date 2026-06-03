@@ -63,8 +63,121 @@ def _set_frozen_batchnorm_eval(model):
             submodule.eval()
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+
+def _get_pass_backbone_and_cfg(model, cfg):
+    if cfg is None:
+        return None, None
+    module = _unwrap_model(model)
+    model_cfg = getattr(module, 'model_cfg', None)
+    cfg_model = cfg.get('MODEL', None)
+    if cfg_model is not None:
+        model_cfg = cfg_model
+    if model_cfg is None:
+        return None, None
+    backbone_cfg = model_cfg.get('BACKBONE_3D', None)
+    if backbone_cfg is None:
+        return None, None
+    pass_cfg = backbone_cfg.get('PASS_IMAGE_FUSION', None)
+    if pass_cfg is None or not bool(pass_cfg.get('ENABLED', False)):
+        return None, None
+    backbone = getattr(module, 'backbone_3d', None)
+    return backbone, pass_cfg
+
+
+def _set_pass_resnet_trainable_layers(backbone, trainable_layers):
+    image_branch = getattr(backbone, 'pass_image_branch', None)
+    image_backbone = getattr(image_branch, 'backbone', None)
+    body = getattr(image_backbone, 'body', None)
+    if body is None:
+        return None
+
+    trainable_layers = int(trainable_layers)
+    if trainable_layers < 0 or trainable_layers > 5:
+        raise ValueError(f'PaSS ResNet trainable layers must be in [0, 5], got {trainable_layers}')
+    layers_to_train = ['layer4', 'layer3', 'layer2', 'layer1', 'conv1'][:trainable_layers]
+    if trainable_layers == 5:
+        layers_to_train.append('bn1')
+
+    trainable_params = 0
+    frozen_params = 0
+    for name, param in body.named_parameters():
+        is_trainable = any(name.startswith(layer_name) for layer_name in layers_to_train)
+        param.requires_grad_(is_trainable)
+        if is_trainable:
+            trainable_params += int(param.numel())
+        else:
+            frozen_params += int(param.numel())
+    return {
+        'trainable_layers': trainable_layers,
+        'layers_to_train': layers_to_train,
+        'trainable_params': trainable_params,
+        'frozen_params': frozen_params,
+    }
+
+
+def _resolve_stage_value(stage_cfg, cur_epoch):
+    schedule = list(stage_cfg.get('RESNET_TRAINABLE_LAYERS', []))
+    if len(schedule) == 0:
+        return stage_cfg.get('TRAINABLE_LAYERS', None)
+
+    selected = None
+    for item in schedule:
+        start_epoch = int(item.get('START_EPOCH', 0))
+        if int(cur_epoch) >= start_epoch:
+            selected = item
+    if selected is None:
+        selected = schedule[0]
+    return selected.get('TRAINABLE_LAYERS', None)
+
+
+def apply_pass_training_schedule(model, cfg, cur_epoch, logger=None):
+    backbone, pass_cfg = _get_pass_backbone_and_cfg(model, cfg)
+    if backbone is None or pass_cfg is None:
+        return
+
+    target_rho = float(pass_cfg.get('RHO', getattr(backbone, 'pass_rho', 1.0)))
+    warmup_epochs = int(pass_cfg.get('RHO_WARMUP_EPOCHS', 0))
+    if warmup_epochs > 0:
+        rho = target_rho * min(1.0, float(int(cur_epoch) + 1) / float(warmup_epochs))
+    else:
+        rho = target_rho
+    if hasattr(backbone, 'pass_rho'):
+        backbone.pass_rho = float(rho)
+
+    stage_summary = None
+    stage_cfg = pass_cfg.get('STAGED_TRAINING', None)
+    if stage_cfg is not None and bool(stage_cfg.get('ENABLED', False)):
+        trainable_layers = _resolve_stage_value(stage_cfg, cur_epoch)
+        if trainable_layers is not None:
+            stage_summary = _set_pass_resnet_trainable_layers(backbone, trainable_layers)
+
+    signature = (
+        int(cur_epoch),
+        round(float(rho), 8),
+        None if stage_summary is None else int(stage_summary['trainable_layers']),
+    )
+    module = _unwrap_model(model)
+    if getattr(module, '_pass_training_schedule_signature', None) != signature:
+        module._pass_training_schedule_signature = signature
+        if logger is not None:
+            if stage_summary is None:
+                logger.info(f'PaSS schedule epoch={cur_epoch}: rho={rho:.6g}')
+            else:
+                logger.info(
+                    'PaSS schedule '
+                    f'epoch={cur_epoch}: rho={rho:.6g}, '
+                    f'resnet_trainable_layers={stage_summary["trainable_layers"]}, '
+                    f'layers={stage_summary["layers_to_train"]}, '
+                    f'trainable_body_params={stage_summary["trainable_params"]}, '
+                    f'frozen_body_params={stage_summary["frozen_params"]}'
+                )
+
+
 def _snapshot_bn_running_buffers(model):
-    module = model.module if hasattr(model, 'module') else model
+    module = _unwrap_model(model)
     return {
         name: buf.detach().clone()
         for name, buf in module.named_buffers()
@@ -73,7 +186,7 @@ def _snapshot_bn_running_buffers(model):
 
 
 def _restore_bn_running_buffers(model, snapshot):
-    module = model.module if hasattr(model, 'module') else model
+    module = _unwrap_model(model)
     buffers = dict(module.named_buffers())
     for name, saved in snapshot.items():
         if name in buffers:
@@ -81,7 +194,7 @@ def _restore_bn_running_buffers(model, snapshot):
 
 
 def _collect_named_grad_norms(model):
-    module = model.module if hasattr(model, 'module') else model
+    module = _unwrap_model(model)
     model_cfg = getattr(module, 'model_cfg', None)
     if model_cfg is None:
         return {}
@@ -114,6 +227,20 @@ def _collect_named_grad_norms(model):
                             'backbone_3d.patch_guidance_gates',
                             'backbone_3d.patch_guidance_residuals',
                             'backbone_3d.patch_guidance_residual_scale',
+                        ]
+                    )
+                )
+            )
+        pass_cfg = backbone_cfg.get('PASS_IMAGE_FUSION', None)
+        if pass_cfg is not None and pass_cfg.get('ENABLED', False):
+            keywords.extend(
+                list(
+                    pass_cfg.get(
+                        'GRAD_LOG_KEYWORDS',
+                        [
+                            'pass_image_branch',
+                            'pass_pixel_align',
+                            'delta_b_mod',
                         ]
                     )
                 )
@@ -188,6 +315,75 @@ def _collect_named_grad_norms(model):
     if total_matches > 0:
         grad_norms['grad_norm/auxiliary_total'] = total_sq_norm ** 0.5
     return grad_norms
+
+
+def _collect_pass_mamba_param_stats(model):
+    module = _unwrap_model(model)
+    model_cfg = getattr(module, 'model_cfg', None)
+    backbone_cfg = getattr(model_cfg, 'BACKBONE_3D', None) if model_cfg is not None else None
+    pass_cfg = backbone_cfg.get('PASS_IMAGE_FUSION', None) if backbone_cfg is not None else None
+    if pass_cfg is None or not pass_cfg.get('ENABLED', False):
+        return {}
+
+    x_proj_sum = 0.0
+    x_proj_count = 0
+    d_sum = 0.0
+    d_count = 0
+    for name, param in module.named_parameters():
+        if '.mamba.x_proj' in name and name.endswith('.weight'):
+            value = param.detach().float().abs()
+            x_proj_sum += float(value.sum().item())
+            x_proj_count += int(value.numel())
+        elif name.endswith('.mamba.D') or name.endswith('.mamba.D_b'):
+            value = param.detach().float().abs()
+            d_sum += float(value.sum().item())
+            d_count += int(value.numel())
+
+    stats = {}
+    if x_proj_count > 0:
+        stats['pass_mamba/x_proj_abs_mean'] = x_proj_sum / float(x_proj_count)
+    if d_count > 0:
+        stats['pass_mamba/D_abs_mean'] = d_sum / float(d_count)
+    return stats
+
+
+def _collect_pass_delta_debug_stats(model):
+    module = _unwrap_model(model)
+    records = []
+    for submodule in module.modules():
+        debug_stats = getattr(submodule, 'debug_stats', None)
+        if debug_stats:
+            records.extend(debug_stats)
+    if len(records) == 0:
+        return {}
+
+    keys = [
+        'delta_b_norm',
+        'rho_delta_b_norm',
+        'b_norm',
+        'delta_b_to_b_ratio',
+        'rho_delta_b_to_b_ratio',
+        'delta_b_token_to_b_max',
+    ]
+    stats = {}
+    for key in keys:
+        values = [float(record[key]) for record in records if key in record]
+        if len(values) == 0:
+            continue
+        stats[f'pass_fusion/{key}_mean'] = sum(values) / float(len(values))
+        stats[f'pass_fusion/{key}_max'] = max(values)
+    return stats
+
+
+def _should_collect_pass_slow_stats(model, accumulated_iter):
+    module = _unwrap_model(model)
+    model_cfg = getattr(module, 'model_cfg', None)
+    backbone_cfg = getattr(model_cfg, 'BACKBONE_3D', None) if model_cfg is not None else None
+    pass_cfg = backbone_cfg.get('PASS_IMAGE_FUSION', None) if backbone_cfg is not None else None
+    if pass_cfg is None or not pass_cfg.get('ENABLED', False):
+        return False
+    interval = max(int(pass_cfg.get('PARAM_LOG_INTERVAL', pass_cfg.get('LOG_METRICS_EVERY', 50))), 1)
+    return int(accumulated_iter) % interval == 0
 
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
@@ -292,6 +488,9 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 scaler.unscale_(optimizer)
                 total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
                 tb_dict.update(_collect_named_grad_norms(model))
+                if _should_collect_pass_slow_stats(model, accumulated_iter):
+                    tb_dict.update(_collect_pass_mamba_param_stats(model))
+                    tb_dict.update(_collect_pass_delta_debug_stats(model))
                 if torch.isfinite(total_norm):
                     scaler.step(optimizer)
                     scaler.update()
@@ -309,6 +508,9 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 loss.backward()
                 total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
                 tb_dict.update(_collect_named_grad_norms(model))
+                if _should_collect_pass_slow_stats(model, accumulated_iter):
+                    tb_dict.update(_collect_pass_mamba_param_stats(model))
+                    tb_dict.update(_collect_pass_delta_debug_stats(model))
                 if torch.isfinite(total_norm):
                     optimizer.step()
                     did_optimizer_step = True
@@ -448,6 +650,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
         for cur_epoch in tbar:
             if train_sampler is not None:
                 train_sampler.set_epoch(cur_epoch)
+
+            apply_pass_training_schedule(model, cfg, cur_epoch, logger=logger)
 
             # train one epoch
             if lr_warmup_scheduler is not None and cur_epoch < optim_cfg.WARMUP_EPOCH:
