@@ -54,6 +54,12 @@ class DataAugmentor(object):
             points[:, feature_idx] *= noise_scale
         data_dict['points'] = points
 
+    @staticmethod
+    def _left_multiply_lidar_aug_matrix(data_dict, matrix):
+        if 'lidar_aug_matrix' not in data_dict:
+            data_dict['lidar_aug_matrix'] = np.eye(4, dtype=np.float32)
+        data_dict['lidar_aug_matrix'] = matrix.astype(np.float32) @ data_dict['lidar_aug_matrix'].astype(np.float32)
+
     def random_world_flip(self, data_dict=None, config=None):
         if data_dict is None:
             return partial(self.random_world_flip, config=config)
@@ -64,6 +70,13 @@ class DataAugmentor(object):
                 gt_boxes, points, return_flip=True
             )
             data_dict['flip_%s'%cur_axis] = enable
+            if enable:
+                aug_matrix = np.eye(4, dtype=np.float32)
+                if cur_axis == 'x':
+                    aug_matrix[1, 1] = -1.0
+                else:
+                    aug_matrix[0, 0] = -1.0
+                self._left_multiply_lidar_aug_matrix(data_dict, aug_matrix)
             if 'roi_boxes' in data_dict.keys():
                 num_frame, num_rois,dim = data_dict['roi_boxes'].shape
                 roi_boxes, _, _ = getattr(augmentor_utils, 'random_flip_along_%s' % cur_axis)(
@@ -84,6 +97,15 @@ class DataAugmentor(object):
         gt_boxes, points, noise_rot = augmentor_utils.global_rotation(
             data_dict['gt_boxes'], data_dict['points'], rot_range=rot_range, return_rot=True
         )
+        cosa = np.cos(noise_rot)
+        sina = np.sin(noise_rot)
+        aug_matrix = np.eye(4, dtype=np.float32)
+        aug_matrix[:3, :3] = np.array([
+            [cosa, -sina, 0.0],
+            [sina, cosa, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
+        self._left_multiply_lidar_aug_matrix(data_dict, aug_matrix)
         if 'roi_boxes' in data_dict.keys():
             num_frame, num_rois,dim = data_dict['roi_boxes'].shape
             roi_boxes, _, _ = augmentor_utils.global_rotation(
@@ -112,6 +134,11 @@ class DataAugmentor(object):
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
         data_dict['noise_scale'] = noise_scale
+        aug_matrix = np.eye(4, dtype=np.float32)
+        aug_matrix[0, 0] = noise_scale
+        aug_matrix[1, 1] = noise_scale
+        aug_matrix[2, 2] = noise_scale
+        self._left_multiply_lidar_aug_matrix(data_dict, aug_matrix)
         self._apply_ground_feature_aware_scaling(data_dict, noise_scale)
         return data_dict
 
@@ -151,6 +178,10 @@ class DataAugmentor(object):
                 
         if 'roi_boxes' in data_dict.keys():
             data_dict['roi_boxes'][:, :3] += noise_translate
+
+        aug_matrix = np.eye(4, dtype=np.float32)
+        aug_matrix[:3, 3] = noise_translate.reshape(-1).astype(np.float32)
+        self._left_multiply_lidar_aug_matrix(data_dict, aug_matrix)
         
         data_dict['gt_boxes'] = gt_boxes
         data_dict['points'] = points
@@ -277,6 +308,8 @@ class DataAugmentor(object):
 
         Returns:
         """
+        if 'lidar_aug_matrix' not in data_dict:
+            data_dict['lidar_aug_matrix'] = np.eye(4, dtype=np.float32)
         for cur_augmentor in self.data_augmentor_queue:
             data_dict = cur_augmentor(data_dict=data_dict)
 
