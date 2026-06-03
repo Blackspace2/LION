@@ -15,7 +15,7 @@ from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, model_fn_decorator
 from pcdet.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
-from train_utils.train_utils import ModelEMA, train_model
+from train_utils.train_utils import ModelEMA, apply_pass_training_schedule, train_model
 
 
 def apply_train_freeze(model, cfg, logger):
@@ -80,6 +80,33 @@ def apply_train_freeze(model, cfg, logger):
         logger.info(f'  TRAIN_FREEZE matched: {name}')
     if len(matched_names) > 20:
         logger.info(f'  ... {len(matched_names) - 20} more matched parameters')
+
+
+def _pass_staged_training_enabled(cfg):
+    pass_cfg = cfg.get('MODEL', {}).get('BACKBONE_3D', {}).get('PASS_IMAGE_FUSION', None)
+    if pass_cfg is None or not bool(pass_cfg.get('ENABLED', False)):
+        return False
+    stage_cfg = pass_cfg.get('STAGED_TRAINING', None)
+    return stage_cfg is not None and bool(stage_cfg.get('ENABLED', False))
+
+
+def log_optimizer_param_groups(optimizer, logger):
+    opt = getattr(optimizer, 'opt', optimizer)
+    param_groups = getattr(opt, 'param_groups', [])
+    logger.info(f'Optimizer param groups: {len(param_groups)}')
+    for idx, group in enumerate(param_groups):
+        params = group.get('params', [])
+        param_count = int(group.get('param_count', sum(param.numel() for param in params)))
+        name = group.get('name', f'group_{idx}')
+        lr = group.get('lr', None)
+        wd = group.get('weight_decay', None)
+        lr_mult = group.get('lr_mult', None)
+        logger.info(
+            f'  group[{idx}] name={name}, params={len(params)}, param_count={param_count}, '
+            f'lr={lr}, lr_mult={lr_mult}, weight_decay={wd}'
+        )
+        for sample_name in group.get('sample_names', [])[:5]:
+            logger.info(f'    sample_param: {sample_name}')
 
 
 def parse_config():
@@ -209,8 +236,16 @@ def main():
         model.load_params_from_file(filename=args.pretrained_model, to_cpu=dist_train, logger=logger)
 
     apply_train_freeze(model, cfg, logger)
+    if _pass_staged_training_enabled(cfg) and cfg.OPTIMIZATION.OPTIMIZER == 'adam_onecycle':
+        raise ValueError(
+            'PaSS STAGED_TRAINING is not compatible with adam_onecycle in this repo because '
+            'the fastai optimizer wrapper filters frozen params at optimizer creation. '
+            'Use OPTIMIZATION.OPTIMIZER: adam or disable staging.'
+        )
+    apply_pass_training_schedule(model, cfg, start_epoch, logger=logger)
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
+    log_optimizer_param_groups(optimizer, logger)
     model_ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
     if model_ema is not None:
         logger.info(f'EMA enabled: decay={args.ema_decay}, save_ema_as_model={args.save_ema_as_model}')
