@@ -12,6 +12,8 @@ venv/
 *.bin
 .DS_Store
 output
+pass_runs/
+run_logs/
 version.py
 plugins/
 run/
