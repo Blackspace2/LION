@@ -1,0 +1,92 @@
+_BASE_CONFIG_: cfgs/kitti_models/second_with_lion_mamba_64dim.yaml
+
+DATA_CONFIG:
+    DATASET: 'KittiDataset'
+    DATA_PATH: '../data/kitti'
+    DATA_SPLIT: {
+        'train': train,
+        'test': val
+    }
+    INFO_PATH: {
+        'train': [kitti_infos_train.pkl],
+        'test': [kitti_infos_val.pkl],
+    }
+    GET_ITEM_LIST: ['images', 'points', 'calib_matricies']
+    FOV_POINTS_ONLY: True
+    DATA_AUGMENTOR:
+        DISABLE_AUG_LIST: ['gt_sampling']
+    POINT_FEATURE_ENCODING: {
+        encoding_type: absolute_coordinates_encoding,
+        used_feature_list: ['x', 'y', 'z', 'intensity'],
+        src_feature_list: ['x', 'y', 'z', 'intensity'],
+    }
+
+MODEL:
+    BACKBONE_3D:
+        OPERATOR:
+            NAME: 'PaSSMamba'
+            CFG:
+                c_img: 64
+                rank: 4
+                b_residual_clip: 1.0
+                use_ref_scan: False
+        PASS_IMAGE_FUSION:
+            ENABLED: True
+            RHO: 1.0
+            RHO_WARMUP_EPOCHS: 5
+            C_IMG: 64
+            IMAGE_SCALE: 255.0
+            LOG_METRICS_EVERY: 50
+            GRAD_LOG_KEYWORDS: [
+                'pass_image_branch',
+                'pass_pixel_align',
+                'delta_b_mod',
+            ]
+            IMAGE_BRANCH:
+                NAME: 'ResNet50FPNImageBranch'
+                OUT_CHANNELS: 256
+                WEIGHTS: 'IMAGENET1K_V2'
+                TRAINABLE_LAYERS: 0
+                RETURNED_LAYERS: [2, 3, 4]
+                NUM_SCALES: 3
+                FREEZE: False
+            PIXEL_ALIGN:
+                IN_CHANNELS: [256, 256, 256]
+                OUT_CHANNELS: 64
+            STAGED_TRAINING:
+                ENABLED: True
+                RESNET_TRAINABLE_LAYERS:
+                    - START_EPOCH: 0
+                      TRAINABLE_LAYERS: 0
+                    - START_EPOCH: 6
+                      TRAINABLE_LAYERS: 1
+                    - START_EPOCH: 20
+                      TRAINABLE_LAYERS: 2
+
+OPTIMIZATION:
+    OPTIMIZER: adamw
+    SCHEDULER: cosine
+    LR: 0.001
+    LR_WARMUP: False
+    WARMUP_EPOCH: 1
+    PARAM_GROUPS:
+        - NAME: pass_modulation
+          KEYWORDS: ['pass_pixel_align', 'delta_b_mod']
+          LR_MULT: 2.0
+          WEIGHT_DECAY: 0.0
+        - NAME: pass_image_fpn
+          KEYWORDS: ['pass_image_branch.backbone.fpn']
+          LR_MULT: 0.5
+          WEIGHT_DECAY: 0.0
+        - NAME: pass_resnet_layer4
+          KEYWORDS: ['pass_image_branch.backbone.body.layer4']
+          LR_MULT: 0.05
+          WEIGHT_DECAY: 0.0
+        - NAME: pass_resnet_layer3
+          KEYWORDS: ['pass_image_branch.backbone.body.layer3']
+          LR_MULT: 0.02
+          WEIGHT_DECAY: 0.0
+        - NAME: pass_resnet_layer2
+          KEYWORDS: ['pass_image_branch.backbone.body.layer2']
+          LR_MULT: 0.01
+          WEIGHT_DECAY: 0.0
