@@ -104,6 +104,7 @@ MODEL:
                 VALIDATE_MAPPING: False
                 HEAT_RANK_ITERS: 4
                 HEAT_RANK_ALPHA: 0.65
+                NUM_BANDS: 4
                 RETENTION_TAU: 256.0
                 TEAR_THRESHOLD: 1024.0
             DIAGNOSTICS:
