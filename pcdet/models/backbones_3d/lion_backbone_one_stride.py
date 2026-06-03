@@ -16,6 +16,7 @@ from ..model_utils.vision_lstm2 import xLSTM_Block
 from ..model_utils.ttt import TTTBlock
 from .ground_context_utils import pool_ground_context_to_sparse_coords
 from .patch_context_utils import PATCH_CONTEXT_RAW_DIM, pool_patch_context_to_sparse_coords
+from .pass_lion import PaSSMambaBlock, PixelAlign, ResNet50FPNImageBranch, TinyImageBranch
 from .sbsd import SBSD
 from .lion_improve import (
     GEOMETRY_ORDER_NAMES,
@@ -573,6 +574,7 @@ class PatchExpanding3D(nn.Module):
 
 LinearOperatorMap = {
     'Mamba': MambaBlock,
+    'PaSSMamba': PaSSMambaBlock,
     'RWKV': RWKVBlock,
     'RetNet': RetNetBlock,
     'xLSTM': xLSTM_Block,
@@ -756,6 +758,10 @@ class LIONLayer(nn.Module):
                 window_shape=self.window_shape,
                 shift=self.window_partition.shift,
                 order_name=order_name,
+                num_bands=(
+                    int(cfg_get(self.serialization_cfg, 'NUM_BANDS', 4))
+                    if self.serialization_cfg is not None else 4
+                ),
             )
         if self.topology_order_enabled:
             context = self._build_topology_context(x)
@@ -817,18 +823,59 @@ class LIONLayer(nn.Module):
         self._record_serialization_metrics(lion_improve_state, context, mappings)
         return mappings
 
-    def _forward_serial(self, x, lion_improve_state=None):
+    def _build_pass_features(self, x, pass_state=None, coord_stride=None):
+        if pass_state is None or not pass_state.get('enabled', False):
+            return None, None
+        if not any(getattr(block, 'supports_pass_fusion', False) for block in self.blocks):
+            return None, None
+
+        v_img, fov = pass_state['pixel_align'](
+            coords=x.indices,
+            image_features=pass_state['image_features'],
+            lidar_to_cam=pass_state['lidar_to_cam'],
+            cam_to_img=pass_state['cam_to_img'],
+            image_shape=pass_state.get('image_shape', None),
+            lidar_aug_matrix=pass_state.get('lidar_aug_matrix', None),
+            voxel_size=pass_state.get('voxel_size', None),
+            coord_stride=coord_stride,
+        )
+        tb_dict = pass_state.get('tb_dict', None)
+        if tb_dict is not None and pass_state.get('record_metrics', False):
+            prefix = f'pass_fusion/{self.debug_name}'
+            tb_dict[f'{prefix}/fov_ratio'] = float(fov.float().mean().detach().item()) if fov.numel() > 0 else 0.0
+            tb_dict[f'{prefix}/v_img_norm_mean'] = float(
+                v_img.norm(dim=1).mean().detach().item()
+            ) if v_img.numel() > 0 else 0.0
+        return v_img, fov
+
+    def _forward_serial(self, x, lion_improve_state=None, pass_state=None, coord_stride=None):
         if self.geometry_order_enabled or self.topology_order_enabled:
             mappings = self._build_order_mappings(x, lion_improve_state=lion_improve_state)
         else:
             mappings = self.window_partition(x.indices, x.batch_size, x.spatial_shape)
 
+        v_img_all, fov_all = self._build_pass_features(x, pass_state=pass_state, coord_stride=coord_stride)
         for i, block in enumerate(self.blocks):
             indices = mappings[self.direction[i]]
             x_features = x.features[indices][mappings["flat2win"]]
             x_features = x_features.view(-1, self.group_size, x.features.shape[-1])
 
-            x_features = block(x_features)
+            if getattr(block, 'supports_pass_fusion', False):
+                if v_img_all is not None and fov_all is not None:
+                    v_img = v_img_all[indices][mappings["flat2win"]]
+                    v_img = v_img.view(-1, self.group_size, v_img.shape[-1])
+                    fov = fov_all[indices][mappings["flat2win"]].view(-1, self.group_size)
+                else:
+                    v_img, fov = None, None
+                x_features = block(
+                    x_features,
+                    v_img=v_img,
+                    fov=fov,
+                    rho=pass_state.get('rho', 0.0) if pass_state is not None else 0.0,
+                    pass_enabled=pass_state is not None and pass_state.get('enabled', False),
+                )
+            else:
+                x_features = block(x_features)
 
             x_features = x_features.view(-1, x_features.shape[-1])[mappings["win2flat"]]
             if self.topology_order_enabled:
@@ -840,8 +887,13 @@ class LIONLayer(nn.Module):
 
         return x
 
-    def forward(self, x, lion_improve_state=None):
-        return self._forward_serial(x, lion_improve_state=lion_improve_state)
+    def forward(self, x, lion_improve_state=None, pass_state=None, coord_stride=None):
+        return self._forward_serial(
+            x,
+            lion_improve_state=lion_improve_state,
+            pass_state=pass_state,
+            coord_stride=coord_stride,
+        )
 
 
 class PositionEmbeddingLearned(nn.Module):
@@ -985,9 +1037,27 @@ class LIONBlock(nn.Module):
             self.upsample_list.append(PatchExpanding3D(dim))
             
 
-    def forward(self, x, prior_context=None, patch_pos_context=None, patch_topology_embed=None, lion_improve_state=None):
+    @staticmethod
+    def _mul_stride(stride_xyz, scale_xyz):
+        return [float(a) * float(b) for a, b in zip(stride_xyz, scale_xyz)]
+
+    @staticmethod
+    def _div_stride(stride_xyz, scale_xyz):
+        return [float(a) / float(b) for a, b in zip(stride_xyz, scale_xyz)]
+
+    def forward(
+        self,
+        x,
+        prior_context=None,
+        patch_pos_context=None,
+        patch_topology_embed=None,
+        lion_improve_state=None,
+        pass_state=None,
+        base_coord_stride=None,
+    ):
         features = []
         index = []
+        cur_stride = list(base_coord_stride) if base_coord_stride is not None else [1.0, 1.0, 1.0]
 
         for idx, enc in enumerate(self.encoder):
             cur_patch_pos = patch_pos_context if (
@@ -1002,17 +1072,29 @@ class LIONBlock(nn.Module):
                                          patch_topology_embed=cur_patch_topology)
 
             x = replace_feature(x, pos_emb + x.features)  # x + pos_emb
-            x = enc(x, lion_improve_state=lion_improve_state)
+            x = enc(
+                x,
+                lion_improve_state=lion_improve_state,
+                pass_state=pass_state,
+                coord_stride=cur_stride,
+            )
             features.append(x)
             x, unq_inv = self.downsample_list[idx](x, prior_context=prior_context)
             index.append(unq_inv)
+            cur_stride = self._mul_stride(cur_stride, self.down_scales[idx])
 
         i = 0
         for dec, norm, up_x, unq_inv, up_scale in zip(self.decoder, self.decoder_norm, features[::-1],
                                                       index[::-1], self.down_scales[::-1]):
-            x = dec(x, lion_improve_state=lion_improve_state)
+            x = dec(
+                x,
+                lion_improve_state=lion_improve_state,
+                pass_state=pass_state,
+                coord_stride=cur_stride,
+            )
             x = self.upsample_list[i](x, up_x, unq_inv)
             x = replace_feature(x, norm(x.features))
+            cur_stride = self._div_stride(cur_stride, up_scale)
             i = i + 1
         return x
 
@@ -1112,6 +1194,10 @@ class LION3DBackboneOneStride(nn.Module):
         )
         self.lion_improve_cfg = model_cfg.get('LION_IMPROVE', None)
         self.lion_improve_enabled = self.lion_improve_cfg is not None and self.lion_improve_cfg.get('ENABLED', False)
+        self.pass_fusion_cfg = model_cfg.get('PASS_IMAGE_FUSION', None)
+        self.pass_fusion_enabled = (
+            self.pass_fusion_cfg is not None and self.pass_fusion_cfg.get('ENABLED', False)
+        )
         enabled_guidance_modes = sum([
             int(self.ground_guided_enabled),
             int(self.ground_context_enabled),
@@ -1288,6 +1374,46 @@ class LION3DBackboneOneStride(nn.Module):
             ])
         else:
             self.ground_context_mode = 'off'
+
+        self.pass_fusion_tb_dict = {}
+        if self.pass_fusion_enabled:
+            if self.linear_operator.NAME != 'PaSSMamba':
+                raise ValueError('PASS_IMAGE_FUSION requires BACKBONE_3D.OPERATOR.NAME = PaSSMamba')
+            if voxel_size is None or point_cloud_range is None:
+                raise ValueError('PASS_IMAGE_FUSION requires voxel_size and point_cloud_range')
+            pass_image_cfg = self.pass_fusion_cfg.get('IMAGE_BRANCH', {})
+            pass_align_cfg = self.pass_fusion_cfg.get('PIXEL_ALIGN', {})
+            image_branch_name = pass_image_cfg.get('NAME', 'TinyImageBranch')
+            pass_c_img = int(self.pass_fusion_cfg.get('C_IMG', pass_image_cfg.get('OUT_CHANNELS', 64)))
+            image_out_channels = int(pass_image_cfg.get('OUT_CHANNELS', pass_c_img))
+            self.pass_image_scale = float(self.pass_fusion_cfg.get('IMAGE_SCALE', 255.0))
+            self.pass_rho = float(self.pass_fusion_cfg.get('RHO', 1.0))
+            self.pass_metric_interval = max(int(self.pass_fusion_cfg.get('LOG_METRICS_EVERY', 50)), 1)
+            if image_branch_name == 'TinyImageBranch':
+                self.pass_image_branch = TinyImageBranch(in_channels=3, out_channels=image_out_channels)
+            elif image_branch_name == 'ResNet50FPNImageBranch':
+                self.pass_image_branch = ResNet50FPNImageBranch(
+                    out_channels=image_out_channels,
+                    weights=pass_image_cfg.get('WEIGHTS', 'IMAGENET1K_V2'),
+                    trainable_layers=int(pass_image_cfg.get('TRAINABLE_LAYERS', 0)),
+                    returned_layers=pass_image_cfg.get('RETURNED_LAYERS', [1, 2, 3]),
+                    num_scales=int(pass_image_cfg.get('NUM_SCALES', 3)),
+                )
+            else:
+                raise ValueError(f'Unsupported PASS_IMAGE_FUSION.IMAGE_BRANCH.NAME={image_branch_name}')
+            if bool(pass_image_cfg.get('FREEZE', False)):
+                for param in self.pass_image_branch.parameters():
+                    param.requires_grad_(False)
+            self.pass_pixel_align = PixelAlign(
+                in_channels=pass_align_cfg.get('IN_CHANNELS', [image_out_channels] * 3),
+                out_channels=int(pass_align_cfg.get('OUT_CHANNELS', pass_c_img)),
+                voxel_size=voxel_size,
+                point_cloud_range=point_cloud_range,
+            )
+        else:
+            self.pass_image_scale = 255.0
+            self.pass_rho = 0.0
+            self.pass_metric_interval = 50
 
         self.patchwork_metric_interval = 50
         self.forward_ret_dict = {}
@@ -1485,6 +1611,42 @@ class LION3DBackboneOneStride(nn.Module):
             'tb_dict': {},
             'global_step': int(batch_dict.get('global_step', 0)),
         }
+
+    def build_pass_fusion_state(self, batch_dict):
+        if not self.pass_fusion_enabled:
+            return None
+        required_keys = ['images', 'trans_lidar_to_cam', 'trans_cam_to_img', 'image_shape']
+        missing = [key for key in required_keys if key not in batch_dict]
+        if missing:
+            raise KeyError(f'PASS_IMAGE_FUSION requires batch_dict keys {missing}')
+
+        images = batch_dict['images'].float()
+        if self.pass_image_scale != 1.0:
+            images = images / self.pass_image_scale
+        image_features = self.pass_image_branch(images)
+        global_step = int(batch_dict.get('global_step', 0))
+        record_metrics = (not self.training) or (global_step % self.pass_metric_interval == 0)
+        state = {
+            'enabled': True,
+            'rho': self.pass_rho,
+            'pixel_align': self.pass_pixel_align,
+            'image_features': image_features,
+            'lidar_to_cam': batch_dict['trans_lidar_to_cam'],
+            'cam_to_img': batch_dict['trans_cam_to_img'],
+            'image_shape': batch_dict['image_shape'],
+            'lidar_aug_matrix': batch_dict.get('lidar_aug_matrix', None),
+            'voxel_size': self.pass_pixel_align.voxel_size,
+            'tb_dict': {},
+            'record_metrics': record_metrics,
+        }
+        if record_metrics:
+            state['tb_dict']['pass_fusion/rho'] = float(self.pass_rho)
+            state['tb_dict']['pass_fusion/image_scale'] = float(self.pass_image_scale)
+            for idx, feature in enumerate(image_features):
+                state['tb_dict'][f'pass_fusion/image_feature{idx + 1}_abs_mean'] = float(
+                    feature.detach().abs().mean().item()
+                )
+        return state
 
     def should_record_patchwork_metrics(self, patchwork_state):
         if not self.patchwork_guidance_enabled or patchwork_state is None:
@@ -1799,7 +1961,9 @@ class LION3DBackboneOneStride(nn.Module):
         ground_context_state = self.build_ground_context_state(batch_dict)
         patchwork_state = self.build_patchwork_state(batch_dict)
         lion_improve_state = self.build_lion_improve_state(batch_dict)
+        pass_state = self.build_pass_fusion_state(batch_dict)
         self.forward_ret_dict = {}
+        self.pass_fusion_tb_dict = {}
 
         x = spconv.SparseConvTensor(
             features=voxel_features,
@@ -1838,7 +2002,9 @@ class LION3DBackboneOneStride(nn.Module):
             prior_context=prior_context,
             patch_pos_context=stage0_patch_pos,
             patch_topology_embed=stage0_patch_topology,
-            lion_improve_state=lion_improve_state
+            lion_improve_state=lion_improve_state,
+            pass_state=pass_state,
+            base_coord_stride=self.stage_strides_xyz[0],
         )
         x1, _ = self.dow1(x, prior_context=prior_context)  ## 14.0k --> 16.9k  [32, 1000, 1000]-->[16, 1000, 1000]
         stage1_patch_pos = None
@@ -1864,7 +2030,9 @@ class LION3DBackboneOneStride(nn.Module):
             prior_context=prior_context,
             patch_pos_context=stage1_patch_pos,
             patch_topology_embed=stage1_patch_topology,
-            lion_improve_state=lion_improve_state
+            lion_improve_state=lion_improve_state,
+            pass_state=pass_state,
+            base_coord_stride=self.stage_strides_xyz[1],
         )
         x2, _ = self.dow2(x, prior_context=prior_context)  ## 16.9k --> 18.8k  [16, 1000, 1000]-->[8, 1000, 1000]
         stage2_patch_pos = None
@@ -1890,7 +2058,9 @@ class LION3DBackboneOneStride(nn.Module):
             prior_context=prior_context,
             patch_pos_context=stage2_patch_pos,
             patch_topology_embed=stage2_patch_topology,
-            lion_improve_state=lion_improve_state
+            lion_improve_state=lion_improve_state,
+            pass_state=pass_state,
+            base_coord_stride=self.stage_strides_xyz[2],
         )
         x3, _ = self.dow3(x, prior_context=prior_context)   ## 18.8k --> 19.1k  [8, 1000, 1000]-->[4, 1000, 1000]
         stage3_patch_pos = None
@@ -1916,10 +2086,17 @@ class LION3DBackboneOneStride(nn.Module):
             prior_context=prior_context,
             patch_pos_context=stage3_patch_pos,
             patch_topology_embed=stage3_patch_topology,
-            lion_improve_state=lion_improve_state
+            lion_improve_state=lion_improve_state,
+            pass_state=pass_state,
+            base_coord_stride=self.stage_strides_xyz[3],
         )
         x4, _ = self.dow4(x, prior_context=prior_context)  ## 19.1k --> 18.5k  [4, 1000, 1000]-->[2, 1000, 1000]
-        x = self.linear_out(x4, lion_improve_state=lion_improve_state)
+        x = self.linear_out(
+            x4,
+            lion_improve_state=lion_improve_state,
+            pass_state=pass_state,
+            coord_stride=self.output_stride_xyz,
+        )
         if self.patchwork_guidance_enabled:
             guidance_patch_context_raw, guidance_patch_ids = self.pool_patch_context_raw(
                 points=patchwork_state['points'],
@@ -1966,6 +2143,9 @@ class LION3DBackboneOneStride(nn.Module):
             batch_dict['patchwork_tb_dict'] = patchwork_state['tb_dict']
         if lion_improve_state is not None and lion_improve_state['tb_dict']:
             batch_dict['lion_improve_tb_dict'] = lion_improve_state['tb_dict']
+        if pass_state is not None and pass_state['tb_dict']:
+            self.pass_fusion_tb_dict = pass_state['tb_dict']
+            batch_dict['pass_fusion_tb_dict'] = pass_state['tb_dict']
 
         return batch_dict
 
