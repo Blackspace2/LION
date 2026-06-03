@@ -2,6 +2,7 @@ from .diagnostics import diagnose_graph_context, diagnose_order
 from .serialization import (
     GEOMETRY_ORDER_NAMES,
     build_geometry_order_from_coords,
+    parse_geometry_order_name,
     reverse_order_within_batches,
 )
 from .serialization_diagnostics import (
@@ -26,6 +27,7 @@ __all__ = [
     'cfg_get',
     'diagnose_graph_context',
     'diagnose_order',
+    'parse_geometry_order_name',
     'reverse_order_within_batches',
     'summarize_object_fragmentation',
     'summarize_serialized_groups',
